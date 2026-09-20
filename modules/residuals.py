@@ -202,9 +202,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
     encoder = prim.encoder
     primaries_point = prim.primaries_point
 
-    # --- well forcing: realized rates as data, or the predicted Peaceman source ------------
-    from .config import predicted_well
-
+    # --- well forcing: realized rates as data ----------------------------------------------
     from . import wells as wells_mod
 
     local_centroids = spec.centroids if spec is not None else jnp.asarray(case.centroids, jnp.float32)
@@ -213,20 +211,18 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
     forcing = extras.forcing if extras is not None else None
     forcing_calib = extras.forcing_calib if extras is not None else None
     well_ops = None
-    if cfg.residual_design is not ResidualDesign.DATA_ONLY and pack is None:
+    if pack is None:
         pack = wells_mod.build_well_pack(cfg, case)
     if pack is not None:                       # well_predict backs the diagnostics on every PDE run
         wi_mult = invm.k_mult if invm is not None else None
-        if predicted_well(cfg) and head is None:
-            head = wells_mod.WellHead.from_pack(pack, case)
         well_ops = wells_mod.make_well_residual(
             cfg, case, pack, prim, local_centroids, eff_tables=eff, wi_mult_of=wi_mult,
             head=head)
-    if cfg.residual_design is not ResidualDesign.DATA_ONLY:
+    if True:
         if forcing_calib is None:
             forcing_calib = wells_mod.build_forcing(pack, case)
         if forcing is None:
-            forcing = well_ops.forcing if predicted_well(cfg) else forcing_calib
+            forcing = forcing_calib
 
     def _recombine(Rw, Ro, Rg, b_w, b_o, b_g, rs):
         """(R_w, R_o, R_g) component rows -> (R_P, R_W, R_G) channels (stacked last axis)."""
@@ -474,7 +470,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
     # ---------------- spectral projection (Galerkin | block-norm) and the hybrid ------------
     pde_spectral = pde_hybrid = None
     blocknorm = cfg.spectral_projection == "blocknorm"
-    if cfg.residual_design in (ResidualDesign.SPECTRAL_PDE, ResidualDesign.HYBRID_PDE):
+    if True:
         sqrt_mu = None
         if spec is not None and spec.mu is not None:
             sqrt_mu = jnp.sqrt(jnp.asarray(spec.mu))
@@ -501,7 +497,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
             def pde_spectral(params, t, cells=None, forcing_override=None):
                 return _project(_consistent_channels(params, t, forcing_override))   # (n_eig, 3)
 
-            if cfg.residual_design is ResidualDesign.HYBRID_PDE:
+            if False:   # the hybrid (node-wise saturation) rows are not built here
                 n_p_rows = int(cfg.n_eig)
                 n_s_rows = 2 * int(case.n_nodes)
                 n_tot = n_p_rows + n_s_rows
@@ -549,7 +545,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
     if well_ops is not None:
         well_arr, well_predict = well_ops.well_arr, well_ops.well_predict
         ctrl_arr, ctrl_parts = well_ops.ctrl_arr, well_ops.ctrl_parts
-    use_point = cfg.residual_design is not ResidualDesign.DATA_ONLY
+    use_point = True
     return ResidualOps(
         pde_point=pde_point if use_point else None,
         pde_fem=pde_fem,
@@ -636,13 +632,7 @@ def calibrate_scales(cfg: RunConfig, groups: tuple[str, ...], ops: ResidualOps,
     res_scale = jnp.ones((3,), jnp.float32)
     if "pde" in groups:
         key = random.PRNGKey(seed)
-        if cfg.residual_design is ResidualDesign.HYBRID_PDE:
-            ts = sampling_mod.draw_times(case, key, (4,))
-            r_p, r_s = jax.lax.map(lambda t: ops.pde_hybrid(params0, t, forcing_override=frc), ts)
-            s_p = jnp.std(r_p.reshape(-1)) + 1e-12
-            s_s = jnp.std(r_s.reshape(-1, 2), axis=0) + 1e-12
-            res_scale = jnp.concatenate([s_p[None], s_s])
-        elif cfg.residual_design is ResidualDesign.SPECTRAL_PDE:
+        if True:
             ts = sampling_mod.draw_times(case, key, (4,))
             Rb = jax.lax.map(lambda t: ops.pde_spectral(params0, t, forcing_override=frc), ts)  # (4, n_eig, 3)
             res_scale = jnp.std(Rb.reshape(-1, 3), axis=0) + 1e-12

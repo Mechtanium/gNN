@@ -27,32 +27,7 @@ where:
 from __future__ import annotations
 
 _FIELD_INDEX = {"p_o": 0, "S_w": 1, "S_g": 2, "R_so": 3}
-_FIELD_LABEL = {"p_o": "p_o [psia]", "S_w": "S_w [-]", "S_g": "S_g [-]", "R_so": "R_so [Mscf/stb]"}
 _FIELD_REF = {"p_o": "pres", "S_w": "swat", "S_g": "sgas", "R_so": "rs"}
-
-
-def run_tag(bundle, rid: str = "") -> str:
-    """One-line run-condition descriptor stamped on every figure (mix-proof labeling)."""
-    cfg = bundle.cfg
-    bp = cfg.backprop_design.value if cfg.backprop_design is not None else "-"
-    bits = [cfg.mesh_case.value,
-            f"{cfg.residual_design.value}+{bp}",
-            f"{cfg.input_encoding.value}/{cfg.architecture.value}",
-            f"opt={cfg.special_opt.value}@{cfg.special_opt_after}"]
-    if bundle.spec is not None and bundle.spec.lam is not None:
-        bits.append(f"n_eig={cfg.n_eig} (z:{bundle.spec.n_eig_z})")
-    if cfg.invert:
-        bits.append("invert=" + "+".join(cfg.invert))
-    if rid:
-        bits.append(rid)
-    return " | ".join(bits)
-
-
-def _stamp(fig, tag: str):
-    """Write the run-condition tag onto the figure canvas (bottom-right footer)."""
-    if tag:
-        fig.text(0.995, 0.002, tag, ha="right", va="bottom", fontsize=6.5, color="0.35")
-    return fig
 
 
 def predict_cells(bundle, params, t: float):

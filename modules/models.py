@@ -101,30 +101,6 @@ def _make_dgm_classes():
     return DGMBlock, DGMNet
 
 
-def _make_mlp_classes():
-    """MLP NNX module classes (tanh hidden layers, linear readout)."""
-    import jax.numpy as jnp
-    from flax import nnx
-
-    class MLPLayer(nnx.Module):
-        def __init__(self, W, b):
-            self.W = nnx.Param(W)
-            self.b = nnx.Param(b)
-
-    class MLPNet(nnx.Module):
-        def __init__(self, raw_params):
-            self.layers = nnx.data([MLPLayer(W, b) for (W, b) in raw_params])
-
-        def __call__(self, inputs):
-            x = inputs
-            for layer in self.layers[:-1]:
-                x = jnp.tanh(x @ layer.W[...] + layer.b[...])
-            last = self.layers[-1]
-            return x @ last.W[...] + last.b[...]
-
-    return MLPLayer, MLPNet
-
-
 @dataclass
 class ModelBundle:
     """A built network: functional apply + init state + sharding map + parity references."""
@@ -190,10 +166,6 @@ def build_model(cfg: RunConfig, dim_in: int, seed: int | None = None) -> ModelBu
         model = DGMNet(raw0)
     else:
         raise NotImplementedError("only the DGM architecture is built here")
-        raw_init, raw_apply = None, None
-        raw0 = raw_init_f32(raw_init, key)
-        _, MLPNet = _make_mlp_classes()
-        model = MLPNet(raw0)
 
     graphdef, params0 = nnx.split(model, nnx.Param)
 

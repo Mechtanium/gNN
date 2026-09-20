@@ -58,46 +58,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import (
-    Architecture,
-    BackpropDesign,
     ConfigError,
-    ResidualDesign,
     RunConfig,
-    SpecialOpt,
     dim_in_of,
     load_well_pack_meta,
-    needs_eigenbasis,
-    phys_param_count,
 )
 
 
 def param_count(cfg: RunConfig, dim_in: int | None = None) -> int:
-    """Exact trainable-parameter count: network weights plus inverted physical parameters."""
+    """Exact trainable-parameter count of the DGM network."""
     d = dim_in_of(cfg) if dim_in is None else dim_in
     f = cfg.dim_out
-    if cfg.architecture is Architecture.DGM:
-        m = cfg.m_width
-        net = d * m + m + cfg.n_blocks * (4 * d * m + 4 * m * m + 4 * m) + m * f + f
-    else:
-        layers = (d, *cfg.mlp_hidden, f)
-        net = sum(a * b + b for a, b in zip(layers[:-1], layers[1:]))
-    return net + phys_param_count(cfg) + well_head_param_count(cfg)
-
-
-def well_head_param_count(cfg: RunConfig) -> int:
-    """Trainable p_wf head parameters (T x n_wells) under ``well_model=predicted``, else 0."""
-    from .config import predicted_well
-
-    if not predicted_well(cfg):
-        return 0
-    meta = load_well_pack_meta(cfg)
-    if meta is not None:
-        return int(meta["n_times"]) * int(meta["n_wells"])
-    try:
-        from .config import load_case_meta
-        return int(load_case_meta(cfg)["n_times"]) * _WELL_FALLBACK_WELLS
-    except ConfigError:
-        return 0
+    m = cfg.m_width
+    return d * m + m + cfg.n_blocks * (4 * d * m + 4 * m * m + 4 * m) + m * f + f
 
 
 # ---------------------------------------------------------------------------------------------
@@ -148,22 +121,13 @@ def engd_row_count(
     exact per-group row layout.
     """
     n_cells = case_meta["n_cells"]
-    n_nodes = case_meta["n_nodes"]
     n_times = case_meta["n_times"]
     cap = cfg.full_batch_cap
 
     rows = 0
     for g in groups:
         if g == "pde":
-            if cfg.residual_design is ResidualDesign.SPECTRAL_PDE:
-                rows += cfg.n_eig * _PDE_COMPONENTS * cfg.n_tslice
-            elif cfg.residual_design is ResidualDesign.HYBRID_PDE:
-                rows += (cfg.n_eig + 2 * n_nodes) * cfg.n_tslice
-            elif cfg.backprop_design is BackpropDesign.FEM_NODAL:
-                rows += n_nodes * _PDE_COMPONENTS * cfg.n_tslice
-            else:  # cartesian_pde + chain_rule
-                n_pts = min(n_cells * cfg.n_tslice, cap) if full_batch else batches["pde"]
-                rows += n_pts * _PDE_COMPONENTS
+            rows += cfg.n_eig * _PDE_COMPONENTS * cfg.n_tslice   # Galerkin-projected rows
         elif g == "ic":
             n_pts = min(n_cells, cap) if full_batch else batches["ic"]
             rows += n_pts * _STATE_COMPONENTS
@@ -176,17 +140,6 @@ def engd_row_count(
                 rows += int(meta.get("n_rows_well", meta["n_rows"]))
             else:
                 rows += _WELL_ROW_CHANNELS * _WELL_FALLBACK_WELLS * n_times
-        elif g == "ctrl":
-            meta = load_well_pack_meta(cfg)
-            if meta is not None and "n_rows_ctrl" in meta:
-                rows += int(meta["n_rows_ctrl"])
-            else:
-                rows += 2 * _WELL_FALLBACK_WELLS * n_times
-        elif g == "reg":
-            rows += phys_param_count(cfg) + cfg.inv.n_mb_probes
-        elif g == "bc":
-            n_pts = min(2 * n_cells, cap) if full_batch else batches["bc"]
-            rows += n_pts * _PDE_COMPONENTS
     return rows
 
 
@@ -309,22 +262,18 @@ def oom_report(cfg: RunConfig, resolved, dev_mb: float = _OOM_T4_BUDGET) -> dict
     ad_factor = 1.7 if cfg.precision_policy == "selective_f64" else 1.0
     p = resolved.param_count
 
-    rep = oom_predict(n_eig_eff, cfg.m_width if cfg.architecture is Architecture.DGM else max(cfg.mlp_hidden),
-                      max(n_pde, 1), data_dim, model_dim, dev_mb, nn, ncl, cfg.n_blocks, ad_factor)
+    rep = oom_predict(n_eig_eff, cfg.m_width, max(n_pde, 1), data_dim, model_dim, dev_mb, nn, ncl,
+                      cfg.n_blocks, ad_factor)
 
-    opt_bytes = 8 if cfg.opt_f64 else 4
-    lbfgs_mb = ((4 + 2 * cfg.lbfgs_mem) * p * opt_bytes / model_dim / 1e6
-                if cfg.special_opt is SpecialOpt.LBFGS else 0.0)
+    lbfgs_mb = 0.0
 
-    fem_mb = 0.0
-    if cfg.backprop_design is BackpropDesign.FEM_NODAL:
-        fem_rows_dev = -(-nn // data_dim)
-        fem_rows_live = fem_rows_dev if cfg.fem_chunk <= 0 else min(cfg.fem_chunk, fem_rows_dev)
-        fem_prec_b = 8 if cfg.precision_policy == "selective_f64" else 4
-        width = cfg.m_width if cfg.architecture is Architecture.DGM else max(cfg.mlp_hidden)
-        fem_mb = (fem_rows_live * _FEM_TAPE_C * cfg.n_blocks * (width / model_dim) * 3 * 4
-                  + (ncl / data_dim) * 8 * 64 * 4 * fem_prec_b
-                  + 24.0 * nn * 4) / 1e6
+    fem_rows_dev = -(-nn // data_dim)
+    fem_rows_live = fem_rows_dev if cfg.fem_chunk <= 0 else min(cfg.fem_chunk, fem_rows_dev)
+    fem_prec_b = 8 if cfg.precision_policy == "selective_f64" else 4
+    width = cfg.m_width
+    fem_mb = (fem_rows_live * _FEM_TAPE_C * cfg.n_blocks * (width / model_dim) * 3 * 4
+              + (ncl / data_dim) * 8 * 64 * 4 * fem_prec_b
+              + 24.0 * nn * 4) / 1e6
 
     engd_mb = 0.0
     if resolved.engd_plan is not None:

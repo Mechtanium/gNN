@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from typing import Callable, NamedTuple
 
-from .config import BackpropDesign, ResidualDesign, RunConfig
+from .config import RunConfig
 from .casedata import CaseData
 from .residuals import Extras, ResidualOps, Scales, state_row_mask
 
@@ -71,9 +71,8 @@ def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scale
     """Per-group residual-array builders shared by the loss and the rows view.
 
     Each builder maps ``(params, window) -> scaled residual array`` whose mean
-    square is the group's loss term. The ``well``, ``ctrl`` and ``reg`` groups are
-    deterministic whole-set rows and ignore the window; contact inversion swaps
-    the IC target for the parametric capillary-gravity equilibrium.
+    square is the group's loss term. The ``well`` group is a deterministic
+    whole-set row block and ignores the window.
     """
     import jax
     import jax.numpy as jnp
@@ -89,49 +88,21 @@ def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scale
     builders: dict = {}
 
     if "pde" in groups:
-        if (cfg.residual_design is ResidualDesign.CARTESIAN_PDE
-                and cfg.backprop_design is BackpropDesign.CHAIN_RULE):
-            def pde_arr(params, win: Window):
-                enc_args = encoder.gather_args(win.ci_p)
-                Rp = vmap(lambda c, t, *a: ops.pde_point(params, _xt_of(c, t), *a))(
-                    win.ci_p, win.t_p, *enc_args)
-                return Rp * rs_inv
-        elif cfg.residual_design is ResidualDesign.SPECTRAL_PDE:
-            needs_cells = cfg.backprop_design is BackpropDesign.CHAIN_RULE
-
-            def pde_arr(params, win: Window):
-                cells = win.ci_p if needs_cells else None
-                _slice = jax.checkpoint(lambda ts: ops.pde_spectral(params, ts, cells) * rs_inv)
-                return jax.lax.map(_slice, win.t_p)                      # (S, n_eig, 3)
-        elif cfg.residual_design is ResidualDesign.HYBRID_PDE:
-            bal_p, bal_s = ops.pde_hybrid.balance
-            s_p, s_s = rs_inv[0], rs_inv[1:]
-
-            def pde_arr(params, win: Window):
-                # block-balanced: the mean over the concatenation equals
-                # (mean_p + mean_s) / 2, so neither block is swamped by the other's count
-                def _slice(ts):
-                    r_p, r_s = ops.pde_hybrid(params, ts)
-                    return jnp.concatenate([jnp.reshape(r_p * s_p * bal_p, (-1,)),
-                                            jnp.reshape(r_s * s_s * bal_s, (-1,))])
-                return jax.lax.map(jax.checkpoint(_slice), win.t_p)     # (S, n_eig + 2n)
-        else:  # cartesian_pde + fem_nodal
-            def pde_arr(params, win: Window):
-                _slice = jax.checkpoint(lambda ts: ops.pde_fem(params, ts) * rs_inv)
-                return jax.lax.map(_slice, win.t_p)                      # (S, n, 3)
+        def pde_arr(params, win: Window):
+            _slice = jax.checkpoint(lambda ts: ops.pde_spectral(params, ts, None) * rs_inv)
+            return jax.lax.map(_slice, win.t_p)                          # (S, n_eig, 3)
         builders["pde"] = pde_arr
 
     point_builders: dict = {}      # g -> (point_fn(params, win, i) -> (4,), n_points(win))
 
     if "ic" in groups:
         y_ic = case.y_ic
-        equil = extras.invm.equil_ic if (extras is not None and extras.invm is not None) else None
 
         def ic_arr(params, win: Window):
             enc_args = encoder.gather_args(win.ci_ic)
             Sic = vmap(lambda c, *a: prim.primaries_point(params, _xt_of(c, case.t_ic), *a))(
                 win.ci_ic, *enc_args)
-            target = equil(params, win.ci_ic) if equil is not None else y_ic[win.ci_ic]
+            target = y_ic[win.ci_ic]
             return (Sic - target) / state_scale * state_row_mask(cfg, y_ic[win.ci_ic])
         builders["ic"] = ic_arr
 
@@ -139,7 +110,7 @@ def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scale
             c = win.ci_ic[i]
             enc_args = encoder.gather_args(c)
             Sic = prim.primaries_point(params, _xt_of(c, case.t_ic), *enc_args)
-            target = equil(params, c[None])[0] if equil is not None else y_ic[c]
+            target = y_ic[c]
             return (Sic - target) / state_scale * state_row_mask(cfg, y_ic[c])
         point_builders["ic"] = (ic_point, lambda win: win.ci_ic.shape[0])
 
@@ -160,25 +131,6 @@ def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scale
 
     if "well" in groups:
         builders["well"] = lambda params, win: ops.well_arr(params)
-
-    if "ctrl" in groups:
-        builders["ctrl"] = lambda params, win: ops.ctrl_arr(params)
-
-    if "reg" in groups:
-        builders["reg"] = lambda params, win: ops.reg_arr(params)
-
-    if "bc" in groups:
-        bc_inv = 1.0 / scales.bc_scale
-        bc_cell, bc_axis = case.bc_cell, case.bc_axis
-
-        def bc_arr(params, win: Window):
-            cells = bc_cell[win.bc_sel]
-            axes = bc_axis[win.bc_sel]
-            enc_args = encoder.gather_args(cells)
-            Fb = vmap(lambda c, a, *ea: ops.flux_point(params, _xt_of(c, win.t_b), *ea)[:, a])(
-                cells, axes, *enc_args)
-            return Fb * bc_inv
-        builders["bc"] = bc_arr
 
     builders["_point"] = point_builders
     return builders

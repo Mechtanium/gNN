@@ -108,33 +108,6 @@ def _gauss_2x2x2() -> tuple[np.ndarray, np.ndarray]:
 _CODE_TO_SLOT = np.array([0, 1, 3, 2, 4, 5, 7, 6], dtype=np.int64)
 
 
-def canonicalize_hex_order(verts: np.ndarray, hexes: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Reorder each hex's 8 nodes into the canonical VTK ordering of the reference cube.
-
-    ``reservoir_mesh.corner_cells`` / ``cell_to_unique_vertices`` do **not** use one
-    fixed corner ordering across cells, so a fixed reference element is invalid as
-    given.  For an axis-aligned grid each corner is unambiguously placed in the
-    ``{0,1}^3`` lattice by the sign of its coordinate relative to the cell centroid
-    along the global x/y/z axes; we use that to rebuild a consistent connectivity.
-
-    Returns the reordered ``(n_hex, 8)`` connectivity and a ``bool`` that is
-    ``True`` iff every cell's 8 corners mapped bijectively onto the 8 lattice
-    slots (i.e. the cells are axis-aligned boxes, as in SPE1CASE1).
-    """
-    verts = np.asarray(verts, dtype=np.float64)
-    hexes = np.asarray(hexes, dtype=np.int64)
-    coords = verts[hexes]                                   # (n_hex, 8, 3)
-    centroid = coords.mean(axis=1, keepdims=True)           # (n_hex, 1, 3)
-    bits = (coords > centroid).astype(np.int64)             # (n_hex, 8, 3)
-    codes = bits[..., 0] + 2 * bits[..., 1] + 4 * bits[..., 2]   # (n_hex, 8)
-    slots = _CODE_TO_SLOT[codes]                            # (n_hex, 8)
-    out = np.zeros_like(hexes)
-    np.put_along_axis(out, slots, hexes, axis=1)
-    # Bijective iff each row's slots are a permutation of 0..7.
-    bijective = bool(np.all(np.sort(slots, axis=1) == np.arange(8)[None, :]))
-    return out, bijective
-
-
 def canonical_hexes_from_corner_cells(
     verts: np.ndarray,
     hexes: np.ndarray,
@@ -295,26 +268,6 @@ def build_static_hex_fem(
     }
 
 
-def vertex_to_hex_mean(
-    vertex_values: jnp.ndarray,
-    static: dict[str, Any],
-    *,
-    dtype: Any = None,
-) -> jnp.ndarray:
-    """Average a per-vertex field to per-hex by the mean of its 8 corner nodes.
-
-    ``vertex_values`` may be ``(n_vertices,)`` or ``(..., n_vertices)``; the
-    trailing vertex axis is replaced by a hex axis of length ``n_hex``.
-    ``dtype=None`` keeps the historical :data:`REAL` (float32) arithmetic
-    bit-exactly; callers on a promoted precision policy pass their working
-    dtype (e.g. float64) so the mean accumulates there.
-    """
-    dt = REAL if dtype is None else dtype
-    nodes = static["hex_nodes"]  # (n_hex, 8)
-    gathered = jnp.take(jnp.asarray(vertex_values, dtype=dt), nodes, axis=-1)
-    return jnp.mean(gathered, axis=-1)
-
-
 # ---------------------------------------------------------------------------------------------
 # Node <-> element-local transfer as a linear primitive pair with gather-only transposes
 # ---------------------------------------------------------------------------------------------
@@ -406,13 +359,6 @@ def nodes_of_local(loc: jnp.ndarray, static: dict[str, Any]) -> jnp.ndarray:
     return _hex_gsum_p.bind(loc, static["hex_nodes"], node_incidence(static))
 
 
-def _scatter_dense(elem_blocks: jnp.ndarray, static: dict[str, Any]) -> jnp.ndarray:
-    """Scatter-add (n_hex, 8, 8) element blocks into a dense (n, n) matrix."""
-    n = static["n_vertices"]
-    out = jnp.zeros((n, n), dtype=REAL)
-    return out.at[static["rows"], static["cols"]].add(elem_blocks.reshape(-1))
-
-
 def _stiffness_elem_blocks(
     d_hex_diag: jnp.ndarray,
     static: dict[str, Any],
@@ -436,23 +382,6 @@ def _stiffness_elem_blocks(
     weighted = dN * d[:, None, None, :]
     k_gp = jnp.einsum("egai,egbi->egab", weighted, dN)         # (n_hex, n_gp, 8, 8)
     return jnp.einsum("eg,egab->eab", JxW, k_gp)               # (n_hex, 8, 8)
-
-
-def assemble_stiffness(
-    d_hex_diag: jnp.ndarray,
-    static: dict[str, Any],
-    *,
-    field_darcy_coeff: float = FIELD_DARCY_COEFF,
-) -> jnp.ndarray:
-    """Dense (n, n) stiffness from a per-hex diagonal diffusivity ``(n_hex, 3)``.
-
-    ``K_e = sum_gp JxW * (dN diag(d)) @ dN^T`` with the diffusivity held constant
-    over the element (cell-wise rock x mobility), scaled by the FIELD Darcy factor.
-    Infeasible at large node counts (``n^2`` storage); use :func:`stiffness_matvec`
-    inside residuals and :func:`assemble_stiffness_sparse` for the eigenbasis.
-    """
-    k_elem = _stiffness_elem_blocks(d_hex_diag, static)
-    return jnp.asarray(field_darcy_coeff, dtype=REAL) * _scatter_dense(k_elem, static)
 
 
 def stiffness_axis_blocks(static: dict[str, Any], *, dtype: Any = None) -> jnp.ndarray:
@@ -535,25 +464,6 @@ def stiffness_matvec(
         y_loc = jnp.einsum("ei,eia->ea", jnp.asarray(d_hex_diag, dtype=dt), z)
         out = nodes_of_local(y_loc, static)
     return jnp.asarray(field_darcy_coeff, dtype=dt) * out
-
-
-def assemble_mass(
-    s_hex: jnp.ndarray,
-    static: dict[str, Any],
-    *,
-    rb_per_ft3: float = RB_PER_FT3,
-) -> jnp.ndarray:
-    """Dense (n, n) consistent-mass operator from a per-hex storage ``(n_hex,)``.
-
-    ``M_e = sum_gp JxW * s * N N^T`` (consistent mass), scaled to reservoir
-    barrels.  Pass ``s_hex = 1`` for the Laplace-Beltrami mass ``int N_i N_j``.
-    """
-    N = static["N"]                          # (n_hex, n_gp, 8)
-    JxW = static["JxW"]                       # (n_hex, n_gp)
-    s = jnp.asarray(s_hex, dtype=REAL)        # (n_hex,)
-    m_gp = jnp.einsum("ega,egb->egab", N, N)                   # (n_hex, n_gp, 8, 8)
-    m_elem = jnp.einsum("eg,egab->eab", JxW * s[:, None], m_gp)
-    return jnp.asarray(rb_per_ft3, dtype=REAL) * _scatter_dense(m_elem, static)
 
 
 def assemble_stiffness_sparse(
@@ -698,31 +608,6 @@ def mass_matvec(
             y_loc.reshape(-1, v.shape[1]))
     out = jnp.asarray(rb_per_ft3, dtype=dt) * out
     return out[:, 0] if squeeze else out
-
-
-def assemble_phase_operators(
-    f_hex: jnp.ndarray,
-    storage_hex: jnp.ndarray,
-    static: dict[str, Any],
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Assemble FIELD-unit per-phase stiffness and mass stacks.
-
-    Parameters
-    ----------
-    f_hex : (n_phases, n_hex) per-phase mobility factor ``k_r/(mu B)``.
-    storage_hex : (n_phases, n_hex) or (n_hex,) storage coefficient ``c_t/B``.
-
-    Returns ``K_stack`` (n_phases, n, n) and ``M_stack`` (n_phases, n, n).
-    """
-    k_diag = static["k_hex_diag"]            # (n_hex, 3)
-    d_stack = f_hex[:, :, None] * k_diag[None, :, :]          # (n_phases, n_hex, 3)
-    K_stack = jax.vmap(lambda d: assemble_stiffness(d, static))(d_stack)
-    storage = jnp.asarray(storage_hex, dtype=REAL)
-    if storage.ndim == 1:
-        storage = jnp.broadcast_to(storage[None, :], f_hex.shape)
-    s_stack = static["poro_hex"][None, :] * storage
-    M_stack = jax.vmap(lambda s: assemble_mass(s, static))(s_stack)
-    return K_stack, M_stack
 
 
 def centroid_features_and_gradients(

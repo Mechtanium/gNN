@@ -119,7 +119,7 @@ from .config import BackpropDesign, ResidualDesign, RunConfig
 from .casedata import CaseData
 from .meshenv import MeshEnv
 from .physics import Primaries
-from .spectral import SpectralBundle, raw_centroid_modes, raw_modes
+from .spectral import SpectralBundle, raw_modes
 
 # Smooth potential-upwinding sharpness [1/psi]: strong donor weighting for
 # element potential drops beyond a few psi, near-central blending below.
@@ -519,26 +519,6 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
 
                 pde_hybrid.balance = (bal_p, bal_s)
 
-        else:
-            v_c_raw = raw_centroid_modes(spec)                           # (n_cells, n_eig)
-            vol_c = jnp.sum(spec.static["JxW"], axis=1)                  # (n_cells,) cell volumes
-            centroids = spec.centroids
-            n_cells = case.n_cells
-
-            def pde_spectral(params, t, cells=None, forcing_override=None):
-                ci = jnp.arange(n_cells) if cells is None else cells
-                xt = jnp.concatenate([centroids[ci],
-                                      jnp.broadcast_to(jnp.reshape(t, (1,)), (ci.shape[0],))[:, None]],
-                                     axis=1)
-                enc_args = encoder.gather_args(ci)
-                R = jax.vmap(lambda x, *a: pde_point(params, x, *a))(xt, *enc_args)  # (|S|, 3)
-                w = (vol_c[ci] * (n_cells / ci.shape[0]))[:, None]
-                if blocknorm:
-                    mu = jnp.asarray(sqrt_mu, R.dtype)[:, None] ** 2
-                    ss = jnp.abs(jnp.asarray(v_c_raw, R.dtype)[ci]).T @ (R * R * jnp.asarray(w, R.dtype))
-                    return jnp.sqrt(mu * ss + jnp.asarray(1e-30, R.dtype))
-                Rs = jnp.asarray(v_c_raw, R.dtype)[ci].T @ (R * jnp.asarray(w, R.dtype))
-                return Rs * jnp.asarray(sqrt_mu, R.dtype)[:, None]
 
     # ---------------- well observables and inversion penalties -------------------------------
     well_arr = well_predict = reg_arr = ctrl_arr = ctrl_parts = None

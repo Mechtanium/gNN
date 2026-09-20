@@ -20,14 +20,10 @@ def _import_deepfield():
     return importlib.import_module("field")
 
 
-try:
-    _DEEPFIELD = _import_deepfield()
-    _DEEPFIELD_IMPORT_ERROR = None
-except ImportError as exc:  # pragma: no cover - depends on local environment
-    _DEEPFIELD = None
-    _DEEPFIELD_IMPORT_ERROR = exc
+_DEEPFIELD = _import_deepfield()
+_DEEPFIELD_IMPORT_ERROR = None
 
-if _DEEPFIELD is not None:
+if True:
     try:
         from field.field.grids import CornerPointGrid, OrthogonalGrid
     except ImportError:  # pragma: no cover - compatibility with older DeepField variants
@@ -168,284 +164,6 @@ def _normalize_rows(vectors: np.ndarray, tol: float = 1e-12, label: str = "vecto
     return vectors / norms[:, None]
 
 
-def _safe_attribute(component: Any, attr_name: str) -> Any:
-    for candidate in (attr_name, attr_name.lower(), attr_name.upper()):
-        if hasattr(component, candidate):
-            return getattr(component, candidate)
-    data = getattr(component, "_data", None)
-    if isinstance(data, dict):
-        for candidate in (attr_name.upper(), attr_name.lower().upper(), str(attr_name).upper()):
-            if candidate in data:
-                return data[candidate]
-    raise AttributeError(f"Could not find attribute '{attr_name}' on {type(component).__name__}.")
-
-
-def _results_basename_candidates(path_to_results: str | Path, preferred: str | None = None) -> list[str]:
-    """Infer candidate restart basenames from an extracted RESULTS directory."""
-    path_to_results = Path(path_to_results)
-    counts: dict[str, int] = {}
-    binary_suffixes = {".RSSPEC", ".UNRST", ".RSM", ".INIT", ".INSPEC", ".SMSPEC", ".UNSMRY"}
-    for path in path_to_results.rglob("*"):
-        if not path.is_file():
-            continue
-        suffix = path.suffix.upper()
-        if suffix in binary_suffixes or re.fullmatch(r"\.X\d+", path.suffix, flags=re.IGNORECASE):
-            counts[path.stem] = counts.get(path.stem, 0) + 1
-
-    ordered: list[str] = []
-    if preferred:
-        ordered.append(str(preferred))
-    for stem, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0].lower())):
-        if stem not in ordered:
-            ordered.append(stem)
-    return ordered
-
-
-def _load_states_attribute(field, attr_name: str) -> Any:
-    """Return a states attribute, lazily loading binary results if DeepField left states empty."""
-    try:
-        return _safe_attribute(field.states, attr_name)
-    except AttributeError:
-        pass
-
-    if not hasattr(field, "_get_results_path"):
-        raise AttributeError(f"Could not find attribute '{attr_name}' on {type(field.states).__name__}.")
-
-    path_to_results = field._get_results_path(raise_errors=False)
-    if path_to_results is None:
-        raise AttributeError(
-            f"Could not find attribute '{attr_name}' on {type(field.states).__name__}, "
-            "and no DeepField RESULTS path was available for lazy loading."
-        )
-
-    preferred_basename = getattr(field, "basename", None)
-    candidates = _results_basename_candidates(path_to_results, preferred=preferred_basename)
-    attempted: list[str] = []
-    for basename in candidates:
-        attempted.append(basename)
-        try:
-            from field.field.parse_utils import read_ecl_bin
-            from field.field.utils import get_multout_paths, get_single_path
-        except Exception:
-            continue
-
-        logger = getattr(field, "_logger", None)
-        rsspec_path = get_single_path(path_to_results, basename + ".RSSPEC")
-        if rsspec_path is not None and hasattr(field.states, "_load_ecl_rsspec"):
-            try:
-                field.states._load_ecl_rsspec(rsspec_path, logger=logger)
-            except Exception:
-                pass
-
-        data = None
-        unifout_path = get_single_path(path_to_results, basename + ".UNRST", logger)
-        if unifout_path is not None:
-            try:
-                states = read_ecl_bin(unifout_path, [attr_name], sequential=True, logger=logger)
-                data = states.get(attr_name.upper(), states.get(attr_name, states.get(attr_name.lower())))
-                if data is not None:
-                    data = np.asarray(data)
-            except Exception:
-                data = None
-
-        if data is None:
-            multout_paths = get_multout_paths(path_to_results, basename)
-            if multout_paths is not None:
-                chunks = []
-                try:
-                    for path in multout_paths:
-                        state = read_ecl_bin(path, [attr_name], logger=logger)
-                        chunk = state.get(attr_name.upper(), state.get(attr_name, state.get(attr_name.lower())))
-                        if chunk is not None:
-                            chunks.append(np.asarray(chunk))
-                except Exception:
-                    chunks = []
-                if chunks:
-                    data = np.stack(chunks, axis=0)
-
-        if data is None:
-            continue
-
-        setattr(field.states, attr_name, data)
-        if hasattr(field.states, "state") and attr_name.upper() not in getattr(field.states.state, "binary_attributes", []):
-            field.states.state.binary_attributes.append(attr_name.upper())
-        return _safe_attribute(field.states, attr_name)
-
-    available = tuple(getattr(field.states, "attributes", ()))
-    raise AttributeError(
-        f"Could not find attribute '{attr_name}' on {type(field.states).__name__}. "
-        f"Tried lazy-loading from RESULTS using basenames {attempted or [preferred_basename]}. "
-        f"Loaded states attributes are {available}."
-    )
-
-
-def _load_state_report_steps(field) -> np.ndarray | None:
-    """Return sparse report-step ids for loaded state snapshots when available."""
-    cache_name = "_delta_pinns_state_report_steps"
-    if hasattr(field, cache_name):
-        cached = getattr(field, cache_name)
-        if cached is None:
-            return None
-        return np.asarray(cached, dtype=int)
-
-    if not hasattr(field, "_get_results_path"):
-        setattr(field, cache_name, None)
-        return None
-
-    path_to_results = field._get_results_path(raise_errors=False)
-    if path_to_results is None:
-        setattr(field, cache_name, None)
-        return None
-
-    preferred_basename = getattr(field, "basename", None)
-    candidates = _results_basename_candidates(path_to_results, preferred=preferred_basename)
-    logger = getattr(field, "_logger", None)
-
-    for basename in candidates:
-        try:
-            from field.field.parse_utils import read_ecl_bin
-            from field.field.utils import get_multout_paths, get_single_path
-        except Exception:
-            break
-
-        unifout_path = get_single_path(path_to_results, basename + ".UNRST", logger)
-        if unifout_path is not None:
-            try:
-                sections = read_ecl_bin(unifout_path, ["SEQNUM"], sequential=True, logger=logger)
-                seqnum = sections.get("SEQNUM")
-                if seqnum:
-                    report_steps = np.asarray(seqnum, dtype=int).reshape(-1)
-                    setattr(field, cache_name, report_steps)
-                    return report_steps
-            except Exception:
-                pass
-
-        multout_paths = get_multout_paths(path_to_results, basename)
-        if multout_paths is None:
-            continue
-        report_steps = []
-        for path in multout_paths:
-            match = re.fullmatch(r"\.X(\d+)", Path(path).suffix, flags=re.IGNORECASE)
-            if match is not None:
-                report_steps.append(int(match.group(1)))
-        if report_steps:
-            report_steps_arr = np.asarray(report_steps, dtype=int)
-            setattr(field, cache_name, report_steps_arr)
-            return report_steps_arr
-
-    setattr(field, cache_name, None)
-    return None
-
-
-def _resolve_state_dates(field, n_times: int, report_steps: np.ndarray | None = None) -> pd.Index:
-    """Infer state dates from binary metadata, well results, or deck dates."""
-    state_dates = pd.to_datetime(getattr(field.states, "dates", pd.to_datetime([])))
-    if len(state_dates) >= n_times:
-        return state_dates[:n_times]
-
-    report_steps_arr = None if report_steps is None else np.asarray(report_steps, dtype=int).reshape(-1)
-    start = getattr(field, "start", None) or field.meta.get("START")
-    date_sources = []
-
-    try:
-        result_dates = pd.to_datetime(np.asarray(field.result_dates))
-        if len(result_dates):
-            date_sources.append(result_dates)
-    except Exception:
-        pass
-
-    meta_dates = field.meta.get("DATES", [])
-    if len(meta_dates):
-        date_sources.append(pd.to_datetime(np.asarray(meta_dates)))
-
-    for full_dates in date_sources:
-        if report_steps_arr is not None and len(full_dates):
-            max_step = int(report_steps_arr.max()) if report_steps_arr.size else -1
-            if max_step < len(full_dates):
-                return full_dates[report_steps_arr]
-        if len(full_dates) >= n_times:
-            return full_dates[:n_times]
-        if len(full_dates) == n_times - 1 and start is not None:
-            return pd.DatetimeIndex([pd.to_datetime(start)]).append(full_dates)
-
-    if report_steps_arr is not None and len(report_steps_arr) == n_times:
-        return pd.Index(report_steps_arr, name="report_step")
-    return pd.Index(np.arange(n_times, dtype=int), name="step")
-
-
-def _raw_active_mask_without_minpv(field) -> np.ndarray | None:
-    """Reload the grid without MINPV applied so restart states can be aligned to the original ACTNUM ordering."""
-    _require_deepfield()
-    cache_name = "_delta_pinns_raw_active_mask"
-    if hasattr(field, cache_name):
-        return getattr(field, cache_name)
-
-    config = getattr(field, "_config", None)
-    model_path = getattr(field, "path", None)
-    if config is None or model_path is None or "grid" not in config:
-        return None
-
-    try:
-        from field import Field
-    except Exception:
-        return None
-
-    config_copy = deepcopy(config)
-    grid_cfg = deepcopy(config_copy.get("grid", {}))
-    attrs = list(grid_cfg.get("attrs") or [])
-    grid_cfg["attrs"] = [attr for attr in attrs if str(attr).upper() != "MINPV"]
-    config_copy["grid"] = grid_cfg
-
-    raw_field = Field(str(model_path), config=config_copy, loglevel="ERROR").load(include_binary=False)
-    raw_grid = normalize_grid_to_cornerpoint(raw_field)
-    raw_active_mask = np.asarray(raw_grid.actnum, dtype=bool)
-    setattr(field, cache_name, raw_active_mask)
-    return raw_active_mask
-
-
-def _align_active_state_data(field, state_values: np.ndarray, active_mask: np.ndarray) -> np.ndarray:
-    """Align state arrays to the current active-cell mask, including post-MINPV grids."""
-    state_values = np.asarray(state_values)
-    if state_values.ndim == 1:
-        state_values = state_values[None, :]
-
-    active_mask = np.asarray(active_mask, dtype=bool)
-    current_active_count = int(active_mask.sum())
-    if state_values.shape[1] == current_active_count:
-        return state_values
-
-    full_grid_count = int(np.prod(active_mask.shape))
-    if state_values.shape[1] == full_grid_count:
-        return state_values[:, active_mask.ravel(order="F")]
-
-    raw_active_mask = _raw_active_mask_without_minpv(field)
-    if raw_active_mask is not None and int(raw_active_mask.sum()) == state_values.shape[1]:
-        raw_flat = raw_active_mask.ravel(order="F").astype(bool)
-        current_flat = active_mask.ravel(order="F").astype(bool)
-        if np.all(~current_flat | raw_flat):
-            keep_from_raw = current_flat[raw_flat]
-            if int(keep_from_raw.sum()) == current_active_count:
-                return state_values[:, keep_from_raw]
-
-    results_candidates: list[str] = []
-    if hasattr(field, "_get_results_path"):
-        path_to_results = field._get_results_path(raise_errors=False)
-        if path_to_results is not None:
-            results_candidates = _results_basename_candidates(
-                path_to_results,
-                preferred=getattr(field, "basename", None),
-            )
-
-    raise ValueError(
-        "Could not align loaded state data to the current active-cell mask. "
-        f"State width={state_values.shape[1]}, current active cells={current_active_count}, "
-        f"full grid cells={full_grid_count}. "
-        "This usually means the restart/results family does not match the currently loaded grid/deck. "
-        f"Model basename={getattr(field, 'basename', None)!r}, "
-        f"results basenames tried={results_candidates or [getattr(field, 'basename', None)]}."
-    )
-
-
 def _field_has_component(field, name: str) -> bool:
     if name in tuple(getattr(field, "components", ())):
         return True
@@ -454,51 +172,6 @@ def _field_has_component(field, name: str) -> bool:
     except (AttributeError, KeyError, AssertionError):
         return False
     return True
-
-
-def _ensure_vtk_grid(grid):
-    vtk_grid = getattr(grid, "vtk_grid", None)
-    needs_create = vtk_grid is None
-    if vtk_grid is not None:
-        try:
-            needs_create = vtk_grid.GetNumberOfCells() == 0
-        except Exception:
-            needs_create = True
-    if needs_create and hasattr(grid, "create_vtk_grid"):
-        grid.create_vtk_grid()
-    return grid
-
-
-def normalize_grid_to_cornerpoint(field):
-    """Return a spatial DeepField grid with 8 corner coordinates per cell."""
-    _require_deepfield()
-    validate_loaded_model(field, components=("grid",))
-    if not _field_has_component(field, "grid"):
-        raise ValueError("The DeepField model does not have a loaded grid component.")
-    grid = field.grid
-    if hasattr(grid, "state") and not grid.state.spatial:
-        grid.to_spatial()
-
-    if CornerPointGrid is not None and isinstance(grid, CornerPointGrid):
-        return grid
-    if OrthogonalGrid is not None and isinstance(grid, OrthogonalGrid):
-        corner_grid = grid.as_corner_point
-        if hasattr(corner_grid, "state") and not corner_grid.state.spatial:
-            corner_grid.to_spatial()
-        return corner_grid
-    raise TypeError(
-        "The reservoir mesh path currently supports DeepField CornerPointGrid or "
-        "OrthogonalGrid-compatible models only."
-    )
-
-
-def _grid_xyz(grid) -> np.ndarray:
-    """Return full-cell corner coordinates across DeepField grid API variants."""
-    if hasattr(grid, "xyz"):
-        return np.asarray(grid.xyz, dtype=float)
-    if hasattr(grid, "get_xyz"):
-        return np.asarray(grid.get_xyz(), dtype=float)
-    raise AttributeError(f"Could not obtain cell corner coordinates from {type(grid).__name__}.")
 
 
 def _vertex_deduplication(
@@ -977,39 +650,6 @@ def corner_cells_to_reservoir_mesh(
     )
 
 
-def field_to_reservoir_mesh(
-    field,
-    use_only_active: bool = True,
-    dedup_decimals: int = 8,
-    volume_tol: float = 1e-12,
-    jac_rel_tol: float = HEX_JAC_REL_TOL,
-) -> ReservoirMeshData:
-    """Convert a DeepField 8-corner grid into a hexahedral reservoir mesh."""
-    grid = normalize_grid_to_cornerpoint(field)
-    xyz = _grid_xyz(grid)
-    if hasattr(grid, "actnum") and use_only_active:
-        active_mask = np.asarray(grid.actnum, dtype=bool)
-    else:
-        active_mask = np.ones(xyz.shape[:3], dtype=bool)
-    corner_cells = xyz[active_mask][:, DEEPFIELD_TO_CANONICAL, :]
-    cell_volumes = None
-    if hasattr(grid, "cell_volumes"):
-        try:
-            cell_volumes = np.asarray(grid.cell_volumes[active_mask], dtype=float)
-        except Exception:
-            cell_volumes = None
-    return corner_cells_to_reservoir_mesh(
-        corner_cells=corner_cells,
-        active_mask=active_mask,
-        active_cell_indices=np.argwhere(active_mask),
-        cell_volumes=cell_volumes,
-        use_only_active=use_only_active,
-        dedup_decimals=dedup_decimals,
-        volume_tol=volume_tol,
-        jac_rel_tol=jac_rel_tol,
-    )
-
-
 def _hex_vertex_adjacency(cell_to_unique_vertices: list[np.ndarray], n_vertices: int):
     r"""Build the undirected vertex adjacency graph induced by hexahedral cells.
 
@@ -1139,40 +779,6 @@ def compute_component_diagnostics(
     }
 
 
-def cell_data_to_vertices(values: np.ndarray, cell_to_vertices: list[np.ndarray], reducer: str = "mean") -> np.ndarray:
-    """Transfer cell-centered values to vertices by incidence reduction."""
-    if reducer != "mean":
-        raise ValueError("Only reducer='mean' is currently supported.")
-    values = np.asarray(values)
-    nonempty = [np.asarray(v, dtype=int) for v in cell_to_vertices if len(v)]
-    n_vertices = int(max(int(v.max()) for v in nonempty) + 1) if nonempty else 0
-    counts_per_cell = np.asarray([len(vertex_ids) for vertex_ids in cell_to_vertices], dtype=int)
-    if counts_per_cell.sum() == 0:
-        if values.ndim == 1:
-            return np.zeros((0,), dtype=float)
-        if values.ndim == 2:
-            return np.zeros((values.shape[0], 0), dtype=float)
-        raise ValueError("values must be 1D or 2D.")
-
-    flat_vertices = np.concatenate(nonempty) if nonempty else np.zeros((0,), dtype=int)
-    contributing_cells = np.repeat(np.nonzero(counts_per_cell > 0)[0], counts_per_cell[counts_per_cell > 0])
-    counts = np.bincount(flat_vertices, minlength=n_vertices).astype(float)
-    counts[counts == 0.0] = 1.0
-
-    if values.ndim == 1:
-        sums = np.zeros(n_vertices, dtype=float)
-        np.add.at(sums, flat_vertices, values[contributing_cells])
-        return sums / counts
-
-    if values.ndim == 2:
-        out = np.zeros((values.shape[0], n_vertices), dtype=float)
-        for time_idx in range(values.shape[0]):
-            np.add.at(out[time_idx], flat_vertices, values[time_idx, contributing_cells])
-        return out / counts[None, :]
-
-    raise ValueError("values must be 1D or 2D.")
-
-
 def select_time_indices(
     n_times: int,
     selected_steps=None,
@@ -1213,105 +819,12 @@ def select_time_indices(
     return np.unique(idx)
 
 
-def prepare_pressure_snapshots(field, pressure_attr: str = "PRESSURE", selected_steps=None, max_steps: int | None = 16) -> dict[str, Any]:
-    """Extract active-cell pressure snapshots and selected dates from a DeepField model."""
-    validate_loaded_model(field, components=("grid", "states"))
-    if not _field_has_component(field, "states"):
-        raise ValueError("Transient pressure snapshots require a loaded DeepField states component.")
-    grid = normalize_grid_to_cornerpoint(field)
-    active_mask = (
-        np.asarray(grid.actnum, dtype=bool)
-        if hasattr(grid, "actnum")
-        else np.ones(tuple(np.asarray(grid.dimens, dtype=int)), dtype=bool)
-    )
-    pressure = np.asarray(_load_states_attribute(field, pressure_attr))
-    if pressure.ndim == 3:
-        pressure = pressure[None, ...]
-    if pressure.ndim not in (2, 4):
-        raise ValueError(
-            f"Expected {pressure_attr} to have shape (n_times, n_active) or (n_times, nx, ny, nz); got {pressure.shape}."
-        )
-
-    report_steps = _load_state_report_steps(field)
-    if report_steps is not None and len(report_steps) != pressure.shape[0]:
-        report_steps = None
-
-    selected_idx = select_time_indices(
-        pressure.shape[0],
-        selected_steps=selected_steps,
-        max_steps=max_steps,
-        available_steps=report_steps,
-    )
-    if pressure.ndim == 4:
-        pressure_cells = np.stack([pressure[idx][active_mask] for idx in selected_idx], axis=0)
-    else:
-        pressure_cells = _align_active_state_data(field, pressure, active_mask)[selected_idx]
-
-    full_dates = _resolve_state_dates(field, pressure.shape[0], report_steps=report_steps)
-    selected_dates = full_dates[selected_idx]
-    available_report_steps = (
-        np.asarray(report_steps, dtype=int)
-        if report_steps is not None
-        else np.arange(pressure.shape[0], dtype=int)
-    )
-    selected_report_steps = available_report_steps[selected_idx]
-
-    return {
-        "indices": selected_idx,
-        "report_steps": selected_report_steps,
-        "available_report_steps": available_report_steps,
-        "dates": selected_dates,
-        "pressure_cells": pressure_cells,
-        "n_times": pressure.shape[0],
-    }
-
-
-def prepare_state_snapshots(
-    field,
-    state_attrs: tuple[str, ...] = ("PRESSURE", "SWAT", "SGAS", "RS"),
-    selected_steps=None,
-    max_steps: int | None = None,
-) -> dict[str, Any]:
-    """Extract multiple active-cell state snapshots on a shared aligned timeline."""
-    if len(state_attrs) == 0:
-        raise ValueError("state_attrs must contain at least one state attribute.")
-
-    base = prepare_pressure_snapshots(
-        field,
-        pressure_attr=state_attrs[0],
-        selected_steps=selected_steps,
-        max_steps=max_steps,
-    )
-    snapshots = {
-        state_attrs[0]: np.asarray(base["pressure_cells"], dtype=float),
-        "indices": base["indices"],
-        "report_steps": base["report_steps"],
-        "available_report_steps": base["available_report_steps"],
-        "dates": base["dates"],
-        "n_times": base["n_times"],
-    }
-    for attr in state_attrs[1:]:
-        current = prepare_pressure_snapshots(
-            field,
-            pressure_attr=attr,
-            selected_steps=base["indices"],
-            max_steps=max_steps,
-        )
-        snapshots[attr] = np.asarray(current["pressure_cells"], dtype=float)
-
-    if "SWAT" in snapshots and "SGAS" in snapshots:
-        snapshots["SOIL"] = np.asarray(1.0 - snapshots["SWAT"] - snapshots["SGAS"], dtype=float)
-    return snapshots
-
-
 def build_cell_rock_physics_from_arrays(
     reservoir_mesh: ReservoirMeshData,
     perms,
     poro,
-    mu: float = 1.0,
-    c_t: float = 1.0,
 ) -> dict[str, Any]:
-    """Build per-cell hydraulic tensors and storage from active-cell rock arrays."""
+    """Build per-cell permeability tensors and porosity from active-cell rock arrays."""
     perms = np.asarray(perms, dtype=float)
     poro = np.asarray(poro, dtype=float)
     if perms.ndim != 2 or perms.shape[1] != 3:
@@ -1344,43 +857,14 @@ def build_cell_rock_physics_from_arrays(
     frames = reservoir_mesh.cell_frames
     cell_tensors = np.einsum("eia,ea,eja->eij", frames, merged_perms, frames)
 
-    cell_diffusivity = cell_tensors / float(mu)
-    cell_storage = merged_poro * float(c_t)
     return {
         "cell_permeability_diag": merged_perms,
         "raw_cell_permeability_diag": perms,
         "cell_tensors": cell_tensors,
-        "cell_diffusivity": cell_diffusivity,
-        "cell_storage": cell_storage,
         "porosity": merged_poro,
         "raw_porosity": poro,
         "cell_geometry_owner": geometry_owner,
     }
-
-
-def build_cell_rock_physics(
-    field,
-    reservoir_mesh: ReservoirMeshData,
-    perm_attrs: tuple[str, str, str] = ("PERMX", "PERMY", "PERMZ"),
-    poro_attr: str = "PORO",
-    mu: float = 1.0,
-    c_t: float = 1.0,
-) -> dict[str, Any]:
-    """Build per-cell hydraulic tensors and storage from DeepField rock properties."""
-    validate_loaded_model(field, components=("grid", "rock"))
-    if not _field_has_component(field, "rock"):
-        raise ValueError("Hydraulic operator assembly requires a loaded DeepField rock component.")
-    active_mask = reservoir_mesh.active_mask
-    perm_arrays = [np.asarray(_safe_attribute(field.rock, attr))[active_mask] for attr in perm_attrs]
-    perms = np.stack(perm_arrays, axis=1).astype(float)
-    poro = np.asarray(_safe_attribute(field.rock, poro_attr))[active_mask].astype(float)
-    return build_cell_rock_physics_from_arrays(
-        reservoir_mesh=reservoir_mesh,
-        perms=perms,
-        poro=poro,
-        mu=mu,
-        c_t=c_t,
-    )
 
 
 def prepare_aquifer_vertices(field, reservoir_mesh: ReservoirMeshData) -> np.ndarray:
@@ -1544,30 +1028,6 @@ def _spatialize_track(track: np.ndarray | None) -> np.ndarray | None:
     return track[:, :3]
 
 
-def _nearest_track_tangent(track: np.ndarray, point: np.ndarray) -> np.ndarray | None:
-    track = _spatialize_track(track)
-    if track is None or len(track) < 2:
-        return None
-    point = np.asarray(point, dtype=float).reshape(-1)
-    if point.shape[0] < 3:
-        return None
-    point = point[:3]
-    best_tangent = None
-    best_distance = np.inf
-    for start, end in zip(track[:-1], track[1:]):
-        direction = end - start
-        length_sq = float(np.dot(direction, direction))
-        if length_sq <= 1e-12:
-            continue
-        tau = np.clip(np.dot(point - start, direction) / length_sq, 0.0, 1.0)
-        closest = start + tau * direction
-        distance = float(np.linalg.norm(point - closest))
-        if distance < best_distance:
-            best_distance = distance
-            best_tangent = direction
-    return best_tangent
-
-
 def _block_path_tangents(block_centroids: np.ndarray) -> np.ndarray:
     tangents = np.zeros_like(block_centroids)
     if len(block_centroids) == 1:
@@ -1593,13 +1053,16 @@ def compute_qw_full_tensor(
     p_bh: float,
     z_bh: float,
     z_cell: float,
-    rho: float,
-    mu: float,
     r_w: float,
     skin: float = 0.0,
-    g: float = 9.81,
 ) -> dict[str, Any]:
-    """Compute well-index data using the full-tensor well-aligned formulation."""
+    r"""Compute the Peaceman well index from the full-tensor, well-aligned geometry.
+
+    Purely geometric: the index :math:`\mathrm{WI} = 2\pi h_s \sqrt{\det K_\perp} /
+    (\ln(r_e/r_w) + s)` depends on the perforated length, the transverse
+    permeability block, the equivalent radius and the skin; the phase mobilities
+    that turn it into a rate live in the black-oil closures at training time.
+    """
     k_tensor = np.asarray(k_tensor, dtype=float)
     if k_tensor.shape != (3, 3):
         raise ValueError("k_tensor must be 3x3.")
@@ -1638,12 +1101,8 @@ def compute_qw_full_tensor(
 
     det_k_perp = float(np.linalg.det(K_perp))
     WI = 2.0 * math.pi * h_s * math.sqrt(det_k_perp) / (math.log(r_e / r_w) + skin)
-    q_coeff = (
-        2.0 * math.pi * rho * h_s * math.sqrt(det_k_perp) / (mu * (math.log(r_e / r_w) + skin))
-    )
     return {
         "WI": WI,
-        "q_coeff": q_coeff,
         "r_e": r_e,
         "h_s": h_s,
         "h_1_perp": h_1_perp,
@@ -1653,36 +1112,10 @@ def compute_qw_full_tensor(
         "lambda2": lambda2,
         "z_bh": float(z_bh),
         "z_cell": float(z_cell),
-        "rho": float(rho),
-        "g": float(g),
         "p_bh": float(p_bh),
         "skin": float(skin),
         "r_w": float(r_w),
     }
-
-
-def _prepare_wells(field, grid):
-    if not _field_has_component(field, "wells"):
-        return None
-    wells = field.wells
-    if len(getattr(wells, "main_branches", [])) == 0:
-        return None
-
-    _ensure_vtk_grid(grid)
-    source_grid = getattr(field, "grid", None)
-    if source_grid is not None:
-        if hasattr(source_grid, "state") and not source_grid.state.spatial:
-            source_grid.to_spatial()
-        _ensure_vtk_grid(source_grid)
-
-    wells = wells.drop_incomplete()
-    if len(getattr(wells, "main_branches", [])) == 0:
-        return None
-    wells = wells.get_blocks()
-    wells = wells.drop_outside()
-    if len(getattr(wells, "main_branches", [])) == 0:
-        return None
-    return wells
 
 
 def _latest_schedule_row(table: Any, current_date: pd.Timestamp) -> pd.Series | None:
@@ -1739,15 +1172,6 @@ def _segment_reference_depth(segment: Any) -> float:
     return _record_float(row, ("DREF",))
 
 
-def _field_model_path(field: Any) -> Path | None:
-    """Return the source deck path when the loaded Field exposes it."""
-    for attr_name in ("path", "_path"):
-        path_value = getattr(field, attr_name, None)
-        if path_value:
-            return Path(path_value).resolve()
-    return None
-
-
 def _parse_eclipse_date(value: Any) -> pd.Timestamp:
     """Parse Eclipse-style dates such as ``06 'NOV' 1997`` into timestamps."""
     if value is None:
@@ -1800,14 +1224,6 @@ def _parse_optional_float(value: Any) -> float:
     return np.nan
 
 
-def _extract_include_path(line: str) -> str | None:
-    """Extract a quoted include path from an Eclipse INCLUDE payload line."""
-    match = re.search(r"['\"]([^'\"]+)['\"]", line)
-    if match is None:
-        return None
-    return match.group(1).strip()
-
-
 def _collect_schedule_include_paths(model_path: Path) -> list[Path]:
     """Return files included after the deck enters its ``SCHEDULE`` section."""
     if not model_path.is_file():
@@ -1845,22 +1261,6 @@ def _collect_schedule_include_paths(model_path: Path) -> list[Path]:
     return filtered or include_paths
 
 
-def _parse_dates_line(line: str) -> pd.Timestamp:
-    """Parse a single DATES line and return its last explicit date."""
-    tokens = _tokenize_schedule_line(line)
-    if tokens and tokens[0].upper() == "DATES":
-        tokens = tokens[1:]
-    if len(tokens) < 3:
-        return pd.NaT
-
-    parsed_dates: list[pd.Timestamp] = []
-    for idx in range(0, len(tokens) - 2, 3):
-        maybe_date = _parse_eclipse_date(" ".join(tokens[idx : idx + 3]))
-        if pd.notna(maybe_date):
-            parsed_dates.append(maybe_date)
-    return parsed_dates[-1] if parsed_dates else pd.NaT
-
-
 def _parse_tstep_increment(line: str) -> float:
     """Parse a TSTEP payload and return the total number of elapsed days."""
     tokens = _tokenize_schedule_line(line)
@@ -1888,67 +1288,6 @@ def _parse_tstep_increment(line: str) -> float:
     return float(total)
 
 
-def _parse_wconhist_row(line: str, current_date: pd.Timestamp) -> dict[str, Any] | None:
-    """Parse one WCONHIST row into a lightweight control record."""
-    tokens = _tokenize_schedule_line(line)
-    if len(tokens) < 3:
-        return None
-
-    values = _expand_eclipse_tokens(tokens[3:])
-    value1 = _parse_optional_float(values[0] if len(values) > 0 else None)
-    value2 = _parse_optional_float(values[1] if len(values) > 1 else None)
-    value3 = _parse_optional_float(values[2] if len(values) > 2 else None)
-    control = str(tokens[2]).upper()
-
-    rate = np.nan
-    bhpt = np.nan
-    phase = ""
-    if control == "ORAT":
-        rate = -abs(value1) if np.isfinite(value1) else np.nan
-        phase = "OIL"
-    elif control == "WRAT":
-        rate = -abs(value2) if np.isfinite(value2) else np.nan
-        phase = "WATER"
-    elif control == "GRAT":
-        rate = -abs(value3) if np.isfinite(value3) else np.nan
-        phase = "GAS"
-    elif control in {"LRAT", "RESV", "RATE"}:
-        raw_rate = value1 if np.isfinite(value1) else _record_float(
-            {"V1": value1, "V2": value2, "V3": value3},
-            ("V1", "V2", "V3"),
-        )
-        rate = -abs(raw_rate) if np.isfinite(raw_rate) else np.nan
-    elif control in {"BHP", "BHPT", "THP", "THPT"}:
-        bhpt = _record_float({"V1": value1, "V2": value2, "V3": value3}, ("V1", "V2", "V3"))
-
-    return {
-        "DATE": pd.to_datetime(current_date),
-        "WELL": str(tokens[0]).upper(),
-        "MODE": str(tokens[1]).upper(),
-        "CONTROL": control,
-        "RATE": rate,
-        "PHASE": phase,
-        "BHPT": bhpt,
-        "TARGET_1": value1,
-        "TARGET_2": value2,
-        "TARGET_3": value3,
-        "CONTROL_SOURCE": "WCONHIST",
-    }
-
-
-def _parse_welopen_row(line: str, current_date: pd.Timestamp) -> dict[str, Any] | None:
-    """Parse one WELOPEN row into a lightweight open/shut record."""
-    tokens = _tokenize_schedule_line(line)
-    if len(tokens) < 2:
-        return None
-    return {
-        "DATE": pd.to_datetime(current_date),
-        "WELL": str(tokens[0]).upper(),
-        "MODE": str(tokens[1]).upper(),
-        "CONTROL_SOURCE": "WELOPEN",
-    }
-
-
 def _parse_wconprod_row(line: str, current_date: pd.Timestamp) -> dict[str, Any] | None:
     """Parse one WCONPROD row into a lightweight control record."""
     tokens = _tokenize_schedule_line(line)
@@ -1968,26 +1307,6 @@ def _parse_wconprod_row(line: str, current_date: pd.Timestamp) -> dict[str, Any]
         "SLPT": _parse_optional_float(values[4] if len(values) > 4 else None),
         "BHPT": _parse_optional_float(values[5] if len(values) > 5 else None),
         "CONTROL_SOURCE": "WCONPROD",
-    }
-
-
-def _parse_wconinje_row(line: str, current_date: pd.Timestamp) -> dict[str, Any] | None:
-    """Parse one WCONINJE row into a lightweight control record."""
-    tokens = _tokenize_schedule_line(line)
-    if len(tokens) < 2:
-        return None
-
-    values = _expand_eclipse_tokens(tokens[2:])
-    return {
-        "DATE": pd.to_datetime(current_date),
-        "WELL": str(tokens[0]).upper(),
-        "PHASE": str(tokens[1]).upper(),
-        "MODE": str(values[0]).upper() if len(values) > 0 and values[0] is not None else "",
-        "CONTROL": str(values[1]).upper() if len(values) > 1 and values[1] is not None else "",
-        "SPIT": _parse_optional_float(values[2] if len(values) > 2 else None),
-        "PIT": _parse_optional_float(values[2] if len(values) > 2 else None),
-        "BHPT": _parse_optional_float(values[4] if len(values) > 4 else None),
-        "CONTROL_SOURCE": "WCONINJE",
     }
 
 
@@ -2106,67 +1425,6 @@ def _parse_schedule_control_file(schedule_path: Path, start_date: pd.Timestamp) 
             tables["welopen"].append(row)
 
     return controls
-
-
-def _load_schedule_control_cache(field: Any) -> dict[str, dict[str, pd.DataFrame]]:
-    """Load and cache WCONHIST/WELOPEN tables from schedule include files."""
-    cache_name = "_delta_pinn_schedule_control_cache"
-    cached = getattr(field, cache_name, None)
-    if cached is not None:
-        return cached
-
-    model_path = _field_model_path(field)
-    if model_path is None:
-        setattr(field, cache_name, {})
-        return {}
-
-    start_date = _parse_eclipse_date(getattr(field, "meta", {}).get("START"))
-    if pd.isna(start_date):
-        dates = getattr(field, "meta", {}).get("DATES")
-        if dates is not None and len(dates):
-            start_date = pd.to_datetime(dates[0])
-
-    parsed_controls: dict[str, dict[str, list[dict[str, Any]]]] = {}
-    schedule_sources = [model_path] + _collect_schedule_include_paths(model_path)
-    seen_schedule_sources: set[Path] = set()
-    for schedule_path in schedule_sources:
-        schedule_path = schedule_path.resolve()
-        if schedule_path in seen_schedule_sources:
-            continue
-        seen_schedule_sources.add(schedule_path)
-        _merge_schedule_control_cache(parsed_controls, _parse_schedule_control_file(schedule_path, start_date))
-
-    cache: dict[str, dict[str, pd.DataFrame]] = {}
-    for well_name, tables in parsed_controls.items():
-        cache[well_name] = {}
-        for table_name, rows in tables.items():
-            if not rows:
-                continue
-            frame = pd.DataFrame(rows).sort_values("DATE").reset_index(drop=True)
-            cache[well_name][table_name] = frame
-
-    setattr(field, cache_name, cache)
-    return cache
-
-
-def _attach_schedule_control_tables(field: Any, wells: Any) -> None:
-    """Attach parsed WCONHIST and WELOPEN tables to the prepared well segments."""
-    schedule_cache = _load_schedule_control_cache(field)
-    if not schedule_cache:
-        return
-
-    for well_name in getattr(wells, "main_branches", []):
-        tables = schedule_cache.get(str(well_name).upper())
-        if not tables:
-            continue
-        segment = wells[well_name]
-        for attr_name in ("wconhist", "welopen", "wconprod", "wconinje"):
-            table = tables.get(attr_name)
-            if table is None or len(table) == 0:
-                continue
-            existing = getattr(segment, attr_name, None)
-            if existing is None or len(existing) == 0:
-                setattr(segment, attr_name, table.copy())
 
 
 def _infer_control_kind(record: Any) -> str:
@@ -2357,28 +1615,6 @@ def _block_centroids_from_reservoir_mesh(block_indices: np.ndarray, reservoir_me
     return block_centroids
 
 
-def _observed_phase_rates(result_snapshot: dict[str, float], total_rate: float) -> list[tuple[str, float]]:
-    """Per-phase surface rates implied by a well's summary observations.
-
-    Returns ``(phase, signed_surface_rate)`` pairs. Producers (``total_rate < 0``)
-    report withdrawal as negative rates from ``WOPR``/``WWPR``/``WGPR``; injectors
-    report injection as positive rates from ``WWIR``/``WGIR``. Phases whose
-    observed rate is missing or ~zero are dropped.
-    """
-    entries: list[tuple[str, float]] = []
-    if total_rate > 0.0:  # injector
-        for phase, key in (("WATER", "WWIR"), ("GAS", "WGIR")):
-            value = float(result_snapshot.get(key, np.nan))
-            if np.isfinite(value) and abs(value) > 0.0:
-                entries.append((phase, abs(value)))
-    else:  # producer (or unsigned)
-        for phase, key in (("OIL", "WOPR"), ("WATER", "WWPR"), ("GAS", "WGPR")):
-            value = float(result_snapshot.get(key, np.nan))
-            if np.isfinite(value) and abs(value) > 0.0:
-                entries.append((phase, -abs(value)))
-    return entries
-
-
 def _resolve_rate_phase_split(
     control_phase: str,
     total_rate: float,
@@ -2414,266 +1650,6 @@ def _well_control_phase_label(
     if observed:
         return max(observed, key=lambda pr: abs(pr[1]))[0]
     return ""
-
-
-def _series_value(series, idx: int) -> float:
-    """One float out of a pandas Series or a numpy array (NaN when it is missing)."""
-    try:
-        value = series.iloc[idx] if hasattr(series, "iloc") else series[idx]
-    except (IndexError, KeyError):
-        return float("nan")
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float("nan")
-
-
-def prepare_well_metadata(
-    field,
-    reservoir_mesh: ReservoirMeshData,
-    selected_dates,
-    allow_missing_wells: bool = True,
-    rho: float = 1.0,
-    mu: float = 1.0,
-    r_w: float = 0.1,
-    skin_default: float = 0.0,
-    g: float = 9.81,
-    cell_tensors: np.ndarray | None = None,
-) -> dict[str, Any]:
-    """Prepare per-step well metadata for pressure-controlled and rate-controlled wells."""
-    grid = normalize_grid_to_cornerpoint(field)
-    _ensure_vtk_grid(grid)
-    wells = _prepare_wells(field, grid)
-    if wells is None:
-        if allow_missing_wells:
-            return {"has_wells": False, "steps": [{} for _ in range(len(selected_dates))]}
-        raise ValueError("No DeepField wells were available for this model.")
-    _attach_schedule_control_tables(field, wells)
-
-    if isinstance(selected_dates, pd.DatetimeIndex):
-        timeline = selected_dates
-    elif len(selected_dates) and isinstance(selected_dates[0], (pd.Timestamp, np.datetime64)):
-        timeline = pd.to_datetime(selected_dates)
-    else:
-        if allow_missing_wells:
-            return {"has_wells": False, "steps": [{} for _ in range(len(selected_dates))]}
-        raise ValueError("Well metadata requires datetime-aligned pressure snapshots.")
-
-    if cell_tensors is None:
-        rock = build_cell_rock_physics(field, reservoir_mesh, mu=mu, c_t=1.0)
-        cell_tensors = rock["cell_tensors"]
-
-    step_entries = []
-    for current_date in timeline:
-        bhp_entries = []
-        rate_entries = []
-        well_results = []
-        for well_name in wells.main_branches:
-            segment = wells[well_name]
-            blocks = getattr(segment, "blocks", None)
-            if blocks is None or len(blocks) == 0:
-                continue
-
-            block_indices = np.asarray(blocks, dtype=int)
-            block_centroids = _block_centroids_from_reservoir_mesh(block_indices, reservoir_mesh)
-            track = _spatialize_track(getattr(segment, "welltrack", None))
-            tangent_fallback = _block_path_tangents(block_centroids)
-            blocks_info = getattr(segment, "blocks_info", None)
-            if blocks_info is None or len(blocks_info) == 0:
-                continue
-
-            event = _resolve_well_control(segment, current_date)
-            if event is None:
-                continue
-            result_snapshot = _extract_well_result_snapshot(segment, current_date)
-
-            skin_series = blocks_info["SKIN"] if "SKIN" in blocks_info else np.zeros(len(block_indices))
-            perf_ratio_series = blocks_info["PERF_RATIO"] if "PERF_RATIO" in blocks_info else np.ones(len(block_indices))
-            cf_series = blocks_info["CF"] if "CF" in blocks_info else np.full(len(block_indices), np.nan)
-            rad_series = blocks_info["RAD"] if "RAD" in blocks_info else np.full(len(block_indices), np.nan)
-
-            bhpt = float(event["BHPT"]) if "BHPT" in event and pd.notna(event["BHPT"]) else np.nan
-            generic_rate = float(event["RATE"]) if "RATE" in event and pd.notna(event["RATE"]) else np.nan
-            wit = float(event["WIT"]) if "WIT" in event and pd.notna(event["WIT"]) else np.nan
-            git = float(event["GIT"]) if "GIT" in event and pd.notna(event["GIT"]) else np.nan
-            z_bh = float(event["DREF"]) if "DREF" in event and pd.notna(event["DREF"]) else np.nan
-            control_kind = str(event["CONTROL_KIND"]).lower() if "CONTROL_KIND" in event and pd.notna(event["CONTROL_KIND"]) else ""
-            control_phase = str(event["PHASE"]).upper() if "PHASE" in event and pd.notna(event["PHASE"]) else ""
-
-            weight_accumulator = []
-            cell_payloads = []
-            for local_idx, block in enumerate(block_indices):
-                lookup_key = tuple(int(v) for v in block.tolist())
-                if lookup_key not in reservoir_mesh.active_cell_lookup:
-                    continue
-                cell_idx = reservoir_mesh.active_cell_lookup[lookup_key]
-                point = reservoir_mesh.cell_centroids[cell_idx]
-                tangent = _nearest_track_tangent(track, point)
-                if tangent is None:
-                    tangent = tangent_fallback[local_idx]
-                cell_vertices = reservoir_mesh.cell_to_unique_vertices[cell_idx]
-                if len(cell_vertices) == 0:
-                    continue
-                cell_sizes = reservoir_mesh.cell_lengths[cell_idx]
-                z_cell = reservoir_mesh.cell_centroids[cell_idx, 2]
-                skin = float(skin_series.iloc[local_idx]) if hasattr(skin_series, "iloc") else float(skin_series[local_idx])
-                if not np.isfinite(skin):
-                    skin = float(skin_default)
-                # COMPDAT item 9 (wellbore diameter, halved into RAD) overrides the global r_w;
-                # item 8 (an explicit connection transmissibility factor) is carried as ``cf``
-                # so the well pack can honour it the way the simulator does.
-                r_w_block = _series_value(rad_series, local_idx)
-                r_w_block = float(r_w_block) if np.isfinite(r_w_block) and r_w_block > 0.0 else float(r_w)
-                cf = _series_value(cf_series, local_idx)
-                cf = float(cf) if np.isfinite(cf) and cf > 0.0 else float("nan")
-                try:
-                    peaceman = compute_qw_full_tensor(
-                        cell_tensors[cell_idx],
-                        tangent,
-                        tuple(cell_sizes.tolist()),
-                        p_bh=bhpt if np.isfinite(bhpt) else 0.0,
-                        z_bh=z_bh if np.isfinite(z_bh) else z_cell,
-                        z_cell=z_cell,
-                        rho=rho,
-                        mu=mu,
-                        r_w=r_w_block,
-                        skin=skin,
-                        g=g,
-                    )
-                    weight = float(peaceman["WI"])
-                except Exception:
-                    peaceman = None
-                    perf_ratio = float(perf_ratio_series.iloc[local_idx]) if hasattr(perf_ratio_series, "iloc") else float(perf_ratio_series[local_idx])
-                    weight = max((cf if np.isfinite(cf) else 1.0) * perf_ratio, 0.0)
-
-                payload = {
-                    "well_name": str(well_name),
-                    "perf_id": int(local_idx),
-                    "cell_idx": cell_idx,
-                    "cell_vertices": np.asarray(cell_vertices, dtype=int),
-                    "vertex_weights": np.full(len(cell_vertices), 1.0 / len(cell_vertices), dtype=float),
-                    "z_cell": float(z_cell),
-                    "z_bh": float(z_bh if np.isfinite(z_bh) else z_cell),
-                    "tangent": np.asarray(tangent, dtype=float),
-                    "weight": float(weight),
-                    "peaceman": peaceman,
-                    "h_s": float(peaceman["h_s"]) if peaceman is not None else float(cell_sizes[2]),
-                    "r_e": float(peaceman["r_e"]) if peaceman is not None else float(max(max(cell_sizes), r_w_block * 1.01)),
-                    "r_w": float(r_w_block),
-                    "cf": float(cf),
-                    "skin": float(skin),
-                    "K_perp": np.asarray(peaceman["K_perp"], dtype=float) if peaceman is not None else np.eye(2, dtype=float),
-                    "control_kind": control_kind,
-                    "control_phase": control_phase,
-                }
-                weight_accumulator.append(weight)
-                cell_payloads.append(payload)
-
-            if len(cell_payloads) == 0:
-                continue
-
-            provisional_rate = generic_rate if np.isfinite(generic_rate) else 0.0
-            if not np.isfinite(generic_rate):
-                if np.isfinite(wit):
-                    provisional_rate += wit
-                if np.isfinite(git):
-                    provisional_rate += git
-            well_phase = _well_control_phase_label(control_phase, provisional_rate, result_snapshot)
-            well_results.append(
-                {
-                    "well_name": str(well_name),
-                    "control_kind": control_kind,
-                    "control_phase": well_phase,
-                    "control_bhpt": float(bhpt) if np.isfinite(bhpt) else np.nan,
-                    "control_rate": float(generic_rate) if np.isfinite(generic_rate) else np.nan,
-                    "control_wit": float(wit) if np.isfinite(wit) else np.nan,
-                    "control_git": float(git) if np.isfinite(git) else np.nan,
-                    "obs_wbhp": float(result_snapshot["WBHP"]) if np.isfinite(result_snapshot["WBHP"]) else np.nan,
-                    "obs_wthp": float(result_snapshot["WTHP"]) if np.isfinite(result_snapshot["WTHP"]) else np.nan,
-                    "obs_wopr": float(result_snapshot["WOPR"]) if np.isfinite(result_snapshot["WOPR"]) else np.nan,
-                    "obs_wwpr": float(result_snapshot["WWPR"]) if np.isfinite(result_snapshot["WWPR"]) else np.nan,
-                    "obs_wgpr": float(result_snapshot["WGPR"]) if np.isfinite(result_snapshot["WGPR"]) else np.nan,
-                    "obs_wwir": float(result_snapshot["WWIR"]) if np.isfinite(result_snapshot["WWIR"]) else np.nan,
-                    "obs_wgir": float(result_snapshot["WGIR"]) if np.isfinite(result_snapshot["WGIR"]) else np.nan,
-                    "obs_wopt": float(result_snapshot["WOPT"]) if np.isfinite(result_snapshot["WOPT"]) else np.nan,
-                    "obs_wwpt": float(result_snapshot["WWPT"]) if np.isfinite(result_snapshot["WWPT"]) else np.nan,
-                    "obs_wgpt": float(result_snapshot["WGPT"]) if np.isfinite(result_snapshot["WGPT"]) else np.nan,
-                    "total_weight": float(np.sum(weight_accumulator)) if len(weight_accumulator) else 0.0,
-                }
-            )
-
-            if control_kind == "bhp" or (not control_kind and np.isfinite(bhpt) and not np.isfinite(generic_rate)):
-                for payload in cell_payloads:
-                    peaceman = payload["peaceman"]
-                    if peaceman is None:
-                        continue
-                    bhp_entries.append(
-                        {
-                            "well_name": payload["well_name"],
-                            "perf_id": payload["perf_id"],
-                            "cell_idx": payload["cell_idx"],
-                            "cell_vertices": payload["cell_vertices"],
-                            "vertex_weights": payload["vertex_weights"],
-                            "q_coeff": float(peaceman["q_coeff"]),
-                            "p_bh": float(bhpt),
-                            "z_bh": float(payload["z_bh"]),
-                            "z_cell": float(payload["z_cell"]),
-                            "weight": float(payload["weight"]),
-                            "h_s": float(payload["h_s"]),
-                            "r_w": float(payload.get("r_w", float("nan"))),
-                            "cf": float(payload.get("cf", float("nan"))),
-                            "r_e": float(payload["r_e"]),
-                            "skin": float(payload["skin"]),
-                            "K_perp": np.asarray(payload["K_perp"], dtype=float),
-                        }
-                    )
-            else:
-                total_rate = generic_rate if np.isfinite(generic_rate) else 0.0
-                if not np.isfinite(generic_rate):
-                    if np.isfinite(wit):
-                        total_rate += wit
-                    if np.isfinite(git):
-                        total_rate += git
-                if total_rate == 0.0:
-                    continue
-                total_weight = float(np.sum(weight_accumulator))
-                if total_weight <= 0.0:
-                    total_weight = float(len(cell_payloads))
-                    weight_accumulator = [1.0 for _ in cell_payloads]
-                for phase_name, phase_rate in _resolve_rate_phase_split(control_phase, total_rate, result_snapshot):
-                    for payload, weight in zip(cell_payloads, weight_accumulator):
-                        distributed = phase_rate * weight / total_weight
-                        rate_entries.append(
-                            {
-                                "well_name": payload["well_name"],
-                                "perf_id": payload["perf_id"],
-                                "cell_idx": payload["cell_idx"],
-                                "cell_vertices": payload["cell_vertices"],
-                                "vertex_weights": payload["vertex_weights"],
-                                "rate": float(distributed),
-                                "weight": float(payload["weight"]),
-                                "h_s": float(payload["h_s"]),
-                                "r_w": float(payload.get("r_w", float("nan"))),
-                                "cf": float(payload.get("cf", float("nan"))),
-                                "r_e": float(payload["r_e"]),
-                                "skin": float(payload["skin"]),
-                                "K_perp": np.asarray(payload["K_perp"], dtype=float),
-                                "z_bh": float(payload["z_bh"]),
-                                "z_cell": float(payload["z_cell"]),
-                                "control_phase": phase_name,
-                            }
-                        )
-        step_entries.append(
-            {
-                "date": current_date,
-                "bhp_entries": bhp_entries,
-                "rate_entries": rate_entries,
-                "well_results": well_results,
-                "has_wells": bool(bhp_entries or rate_entries),
-            }
-        )
-
-    return {"has_wells": any(step.get("has_wells", False) for step in step_entries), "steps": step_entries}
 
 
 def pack_sequence_well_steps(

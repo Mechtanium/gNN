@@ -70,7 +70,7 @@ where:
 - :math:`C_F`: the FIELD Darcy constant (mD·ft·psi/cP → rb/day).
 - :math:`f_\alpha = k_{r\alpha}/(\mu_\alpha B_\alpha)`: the phase mobility factor at the perforated cell (θ_m-aware through the effective tables); injecting perforations use the total mobility :math:`\lambda_t / B_c` so a dry-gas injector at :math:`S_g = 0` stays well-posed.
 - :math:`p_{\alpha,p}`: the phase pressure at the perforation cell; :math:`\gamma_\alpha (z_p - z_{bh})` the wellbore hydrostatic correction with the phase gravity gradient as the column proxy.
-- :math:`h_s, K_\perp, r_e, s`: perforated length, transverse permeability block, Peaceman equivalent radius, and skin from the prep-cache metadata (:math:`r_w = 0.1` ft, the prep default).
+- :math:`h_s, K_\perp, r_e, s`: perforated length, transverse permeability block, Peaceman equivalent radius, and skin from the prep-cache metadata (:math:`r_w` from the deck's ``COMPDAT`` diameter, or Eclipse's 1 ft default).
 - Sign convention: **injection-positive** (production channels are negated on ingest).
 
 Each (step, well) is classified by its *realized* control mode, mirroring the
@@ -116,8 +116,8 @@ import numpy as onp
 from .config import RunConfig, WellModel, case_label, well_pack_meta_path
 from .casedata import CaseData
 
-# Prep-cache Peaceman defaults (prepare_well_metadata signature).
-_R_W = 0.1
+# Fallback wellbore radius [ft] when a perforation carries no COMPDAT diameter.
+_R_W = 0.5      # Eclipse's COMPDAT default (1 ft diameter), for a cache that predates perf_r_w
 
 # Relative shortfall of realized vs schedule control rate that flags the
 # BHP-limited mode (simulator control switching, detected from the data).
@@ -634,16 +634,6 @@ def _interp_rows(times, table, t):
     return (1.0 - w) * table[i] + w * table[i + 1]
 
 
-def _nearest_row(times, table, t):
-    """The report-step row whose interval contains ``t`` (piecewise-constant flags)."""
-    import jax.numpy as jnp
-
-    ts = times
-    t = jnp.clip(jnp.asarray(t, ts.dtype), ts[0], ts[-1])
-    i = jnp.clip(jnp.searchsorted(ts, t, side="right") - 1, 0, ts.shape[0] - 1)
-    return table[i]
-
-
 # ---------------------------------------------------------------------------------------------
 # The interior forcing induced by the pack (controls-as-data)
 # ---------------------------------------------------------------------------------------------
@@ -990,30 +980,6 @@ def _closure_core(P4, pack: WellPack, case: CaseData, tables, kr_floor: float, w
     return closed_form_head(state, pack, case)
 
 
-def fischer_burmeister(a, b, eps: float = FB_EPS):
-    r"""
-    Smoothed Fischer–Burmeister complementarity residual,
-
-    .. math::
-
-        \phi_\epsilon(a, b) \;=\; \sqrt{a^2 + b^2 + \epsilon^2} \;-\; a \;-\; b,
-
-    which vanishes (up to :math:`\epsilon`) exactly on the set
-    :math:`a \ge 0,\ b \ge 0,\ ab = 0`. For the well's control switch
-    :math:`a = \mathrm{sgn}_w (p_{wf} - p^{\mathrm{lim}}_{bh})/s_{bhp}` (the well may not
-    cross its BHP limit) and :math:`b = (|q^{\mathrm{ctrl}}| - |q_c(\theta)|)/s_{q_c}`
-    (it may not exceed its rate target): a well either meets its rate above the
-    limit or sits on the limit below its rate — the simulator's rule, in one
-    :math:`C^\infty` row with bounded derivatives.
-
-    where:
-    - :math:`\epsilon` (``eps``): the smoothing constant; :math:`\phi_0` is the exact (kinked) FB function.
-    """
-    import jax.numpy as jnp
-
-    return jnp.sqrt(a * a + b * b + eps * eps) - a - b
-
-
 def synthesize_observations(case: CaseData, pack: WellPack, cfg: RunConfig) -> None:
     """Fill the pack's observation arrays from the reference cell states (in place).
 
@@ -1233,61 +1199,5 @@ def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
         rates_at=rates_at)
     return WellOps(well_arr=well_arr, well_predict=well_predict, ctrl_arr=ctrl_arr,
                    forcing=forcing, ctrl_parts=ctrl_parts)
-
-
-def well_match_metrics(pack: WellPack, p_bh_hat: onp.ndarray, q_hat: onp.ndarray,
-                       p_clip: tuple[float, float] | None = None,
-                       p_anchors: tuple[float, float] | None = None) -> dict:
-    """Row-masked observation-match RMSEs (BHP in psi, rates per channel scale), the
-    control-match RMSEs of the ``ctrl`` rows (predicted model), and the rail fraction:
-    under ``closed_form`` the share of rate-mode steps whose eliminated BHP sits on its
-    clip bound (``p_clip``), under ``predicted`` the share of active steps whose head
-    sits within ``_RAIL_TOL`` of the pressure anchors (``p_anchors``) — a railed head
-    is a well whose control the state cannot deliver, and its rows carry no gradient."""
-    out: dict = {}
-    m = pack.bhp_row_mask > 0
-    if m.any():
-        out["well_bhp_rmse"] = float(onp.sqrt(onp.mean((p_bh_hat[m] - pack.bhp_obs[m]) ** 2)))
-    s_bhp, s_qo, s_qw, s_qg = pack.well_scale
-    scale = onp.asarray([s_qo, s_qw, s_qg])
-    errs = []
-    for c, (ph, sign) in enumerate(zip(_CH_PHASE, _CH_SIGN)):
-        mc = pack.ch_row_mask[:, :, c] > 0
-        if mc.any():
-            errs.append((sign * q_hat[:, :, ph][mc] - pack.ch_obs[:, :, c][mc]) / scale[ph])
-    if errs:
-        e = onp.concatenate(errs)
-        out["well_rate_rmse"] = float(onp.sqrt(onp.mean(e ** 2)))
-    predicted = False
-    if predicted:
-        q_c = onp.take_along_axis(q_hat, pack.ctrl_phase[:, :, None], axis=2)[:, :, 0]
-        mr = pack.ctrl_rate_mask > 0
-        if mr.any():
-            out["ctrl_rate_rmse"] = float(onp.sqrt(onp.mean(
-                ((q_c[mr] - pack.q_ctrl[mr]) / scale[pack.ctrl_phase[mr]]) ** 2)))
-        mb = pack.ctrl_bhp_mask > 0
-        if mb.any():
-            out["ctrl_bhp_rmse"] = float(onp.sqrt(onp.mean((p_bh_hat[mb] - pack.p_bh_ctrl[mb]) ** 2)))
-        ml = pack.ctrl_limit_mask > 0
-        if ml.any():
-            sgn = onp.where(pack.q_ctrl > 0, -1.0, 1.0)
-            a = sgn * (p_bh_hat - pack.p_bh_ctrl) / s_bhp
-            b = (onp.abs(pack.q_ctrl) - onp.abs(q_c)) / scale[pack.ctrl_phase]
-            out["ctrl_switch_frac"] = float((onp.abs(a[ml]) < onp.abs(b[ml])).mean())
-        if p_anchors is not None:
-            lo, hi = p_anchors
-            tol = _RAIL_TOL * (hi - lo)
-            act = pack.active > 0
-            if act.any():
-                railed = (p_bh_hat[act] <= lo + tol) | (p_bh_hat[act] >= hi - tol)
-                out["well_bhp_rail_frac"] = float(railed.mean())
-    elif p_clip is not None:
-        closed = (pack.is_rate * (1.0 - pack.binding)) > 0
-        if closed.any():
-            lo, hi = p_clip
-            tol = 1e-3 * (hi - lo)
-            railed = (p_bh_hat[closed] <= lo + tol) | (p_bh_hat[closed] >= hi - tol)
-            out["well_bhp_rail_frac"] = float(railed.mean())
-    return out
 
 

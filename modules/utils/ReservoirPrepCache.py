@@ -34,14 +34,6 @@ PREP_ARTIFACTS_FILENAME = "reservoir_preprocessing_artifacts.joblib"
 PREP_METADATA_FILENAME = "reservoir_preprocessing_metadata.json"
 
 
-def default_model_output_dir(model_path: str | Path, output_root: str | Path) -> Path:
-    return Path(output_root) / Path(model_path).stem
-
-
-def default_prep_cache_dir(model_path: str | Path, output_root: str | Path) -> Path:
-    return default_model_output_dir(model_path, output_root) / "prep_cache"
-
-
 def preprocessing_artifacts_path(cache_dir: str | Path) -> Path:
     return Path(cache_dir) / PREP_ARTIFACTS_FILENAME
 

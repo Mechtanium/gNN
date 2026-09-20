@@ -294,16 +294,3 @@ def oom_report(cfg: RunConfig, resolved, dev_mb: float = _OOM_T4_BUDGET) -> dict
     )
 
 
-def max_m_width(cfg: RunConfig, resolved, dev_mb: float = _OOM_T4_BUDGET, step: int = 8) -> int:
-    """Largest DGM hidden width the chain-rule tape estimate says fits the device."""
-    meta = resolved.case_meta
-    nn, ncl = meta["n_nodes"], meta["n_cells"]
-    data_dim, model_dim = resolved.mesh_shape
-    n_eig_eff = resolved.dim_in - 1
-    n_pde = max(resolved.batches.get("pde", 0), 1)
-    ad_factor = 1.7 if cfg.precision_policy == "selective_f64" else 1.0
-    m = step
-    while oom_predict(n_eig_eff, m, n_pde, data_dim, model_dim, dev_mb, nn, ncl,
-                      cfg.n_blocks, ad_factor)["fits"]:
-        m += step
-    return m - step

@@ -11,48 +11,39 @@ import numpy as np
 import pandas as pd
 
 from modules.utils.ReservoirMesh import (
-    _attach_schedule_control_tables,
     _block_centroids_from_reservoir_mesh,
     _block_path_tangents,
     _collect_schedule_include_paths,
     _expand_eclipse_tokens,
-    _ensure_vtk_grid,
-    _extract_include_path,
     _extract_well_result_snapshot,
-    _field_model_path,
-    _grid_xyz,
     _merge_schedule_control_cache,
-    _nearest_track_tangent,
-    _parse_dates_line,
     _parse_eclipse_date,
     _parse_optional_float,
     _parse_schedule_control_file,
     _parse_tstep_increment,
-    _prepare_wells,
-    _record_float,
-    _record_text,
     _resolve_rate_phase_split,
     _resolve_well_control,
-    _safe_attribute,
     _segment_reference_depth,
     _strip_schedule_comment,
     _spatialize_track,
     _tokenize_schedule_line,
     _well_control_phase_label,
-    DEEPFIELD_TO_CANONICAL,
     build_blackoil_table_pack,
     build_cell_rock_physics_from_arrays,
-    cell_data_to_vertices,
     compute_component_diagnostics,
     compute_qw_full_tensor,
     corner_cells_to_reservoir_mesh,
-    normalize_grid_to_cornerpoint,
     prepare_aquifer_vertices,
     prepare_vertex_category_indices,
-    prepare_state_snapshots,
     select_time_indices,
 )
 from modules.utils.unit_conversion import detect_unit_system, to_field_units
+
+#: Fallbacks for a COMPDAT that omits item 9 (wellbore diameter, default 1 ft ->
+#: a 0.5 ft radius) or item 11 (skin, default 0): Eclipse's own defaults, so a
+#: deck that relies on them is read the way the simulator reads it.
+ECLIPSE_DEFAULT_R_W = 0.5
+ECLIPSE_DEFAULT_SKIN = 0.0
 
 
 STATE_ATTRS_DEFAULT = ("PRESSURE", "SWAT", "SGAS", "RS")
@@ -273,7 +264,7 @@ class ReservoirPreprocessingArtifacts:
     component_diagnostics: dict[str, Any]
     rock_payload: RockPayload
     rock_data: dict[str, Any]
-    state_payload: StateTimelinePayload
+    state_payload: StateTimelinePayload | None   # the raw per-step payload; dropped once snapshotted
     state_data: dict[str, Any]
     cell_states: dict[str, np.ndarray]
     vertex_states: dict[str, np.ndarray]
@@ -618,122 +609,6 @@ class ReservoirExtractorBackend:
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
-
-
-class DeepFieldExtractorBackend(ReservoirExtractorBackend):
-    backend_name = "deepfield"
-
-    def __init__(self, source: ReservoirSource):
-        super().__init__(source)
-        self._field = None
-
-    def _ensure_field(self):
-        if self._field is not None:
-            return self._field
-        deepfield = _import_deepfield()
-        field_module = importlib.import_module("field.field")
-        Field = deepfield.Field
-        default_config = field_module.default_config
-        self._field = Field(
-            str(self.source.data_path),
-            config=default_config,
-            loglevel="ERROR",
-        ).load()
-        return self._field
-
-    def load_geometry(self) -> GridGeometryPayload:
-        field = self._ensure_field()
-        grid = normalize_grid_to_cornerpoint(field)
-        xyz = _grid_xyz(grid)
-        active_mask = (
-            np.asarray(grid.actnum, dtype=bool)
-            if hasattr(grid, "actnum")
-            else np.ones(tuple(np.asarray(xyz.shape[:3], dtype=int)), dtype=bool)
-        )
-        corner_cells = np.asarray(xyz[active_mask][:, DEEPFIELD_TO_CANONICAL, :], dtype=float)
-        cell_volumes = None
-        if hasattr(grid, "cell_volumes"):
-            try:
-                cell_volumes = np.asarray(grid.cell_volumes[active_mask], dtype=float)
-            except Exception:
-                cell_volumes = None
-        return GridGeometryPayload(
-            corner_cells=corner_cells,
-            active_mask=active_mask,
-            active_cell_indices=np.argwhere(active_mask).astype(int),
-            cell_volumes=cell_volumes,
-        )
-
-    def load_rock(
-        self,
-        perm_attrs: tuple[str, str, str] = ("PERMX", "PERMY", "PERMZ"),
-        poro_attr: str = "PORO",
-    ) -> RockPayload:
-        field = self._ensure_field()
-        geometry = self.load_geometry()
-        active_mask = geometry.active_mask
-        perm_arrays = [np.asarray(_safe_attribute(field.rock, attr))[active_mask] for attr in perm_attrs]
-        return RockPayload(
-            perms=np.stack(perm_arrays, axis=1).astype(float),
-            poro=np.asarray(_safe_attribute(field.rock, poro_attr))[active_mask].astype(float),
-            perm_attrs=perm_attrs,
-            poro_attr=poro_attr,
-        )
-
-    def load_states(
-        self,
-        state_attrs: tuple[str, ...] = STATE_ATTRS_DEFAULT,
-        selected_steps=None,
-        max_steps: int | None = None,
-    ) -> StateTimelinePayload:
-        field = self._ensure_field()
-        snapshots = prepare_state_snapshots(
-            field,
-            state_attrs=state_attrs,
-            selected_steps=selected_steps,
-            max_steps=max_steps,
-        )
-        data = {attr: np.asarray(snapshots[attr], dtype=float) for attr in state_attrs}
-        return StateTimelinePayload(
-            snapshots=data,
-            indices=np.asarray(snapshots["indices"], dtype=int),
-            report_steps=np.asarray(snapshots["report_steps"], dtype=int),
-            available_report_steps=np.asarray(snapshots["available_report_steps"], dtype=int),
-            dates=pd.to_datetime(snapshots["dates"]),
-            n_times=int(snapshots["n_times"]),
-        )
-
-    def load_completions(self) -> CompletionPayload:
-        field = self._ensure_field()
-        grid = normalize_grid_to_cornerpoint(field)
-        _ensure_vtk_grid(grid)
-        wells = _prepare_wells(field, grid)
-        if wells is None:
-            return CompletionPayload(source=self.source, meta=dict(getattr(field, "meta", {})), segments={})
-        _attach_schedule_control_tables(field, wells)
-        segments = {
-            str(well_name): wells[well_name]
-            for well_name in getattr(wells, "main_branches", [])
-        }
-        return CompletionPayload(source=self.source, meta=dict(getattr(field, "meta", {})), segments=segments)
-
-    def load_summary(self, completion_payload: CompletionPayload | None = None) -> SummaryPayload:
-        field = self._ensure_field()
-        if completion_payload is None:
-            completion_payload = self.load_completions()
-        results_by_well: dict[str, pd.DataFrame] = {}
-        for well_name, segment in completion_payload.segments.items():
-            table = getattr(segment, "results", None)
-            if table is not None and len(table):
-                results_by_well[well_name] = table.copy()
-        dates = pd.DatetimeIndex([])
-        try:
-            candidate_dates = pd.to_datetime(np.asarray(getattr(field, "result_dates")))
-            if len(candidate_dates):
-                dates = pd.DatetimeIndex(candidate_dates)
-        except Exception:
-            pass
-        return SummaryPayload(results_by_well=results_by_well, dates=dates, addresses_by_well={})
 
 
 def _normalize_ijk_array(indices: np.ndarray, dims: tuple[int, int, int]) -> np.ndarray:
@@ -1792,20 +1667,9 @@ def open_reservoir_backend(
 ) -> ReservoirExtractorBackend:
     source = resolve_reservoir_source(model_path)
     backend_name = str(backend).lower()
-    if backend_name == "deepfield":
-        return DeepFieldExtractorBackend(source)
-    if backend_name == "rips":
-        return RipsExtractorBackend(source, lifecycle=lifecycle)
-    if backend_name != "auto":
-        raise ValueError(f"Unsupported reservoir backend '{backend}'.")
-
-    rips = _try_import("rips")
-    if rips is not None:
-        try:
-            return RipsExtractorBackend(source, lifecycle=lifecycle)
-        except Exception:
-            pass
-    return DeepFieldExtractorBackend(source)
+    if backend_name not in ("rips", "auto"):
+        raise ValueError(f"Unsupported reservoir backend '{backend}' (only 'rips' exists here).")
+    return RipsExtractorBackend(source, lifecycle=lifecycle)
 
 
 def reservoir_mesh_from_geometry_payload(
@@ -1828,15 +1692,11 @@ def reservoir_mesh_from_geometry_payload(
 def build_cell_rock_physics_from_payload(
     rock: RockPayload,
     reservoir_mesh,
-    mu: float = 1.0,
-    c_t: float = 1.0,
 ) -> dict[str, Any]:
     return build_cell_rock_physics_from_arrays(
         reservoir_mesh=reservoir_mesh,
         perms=rock.perms,
         poro=rock.poro,
-        mu=mu,
-        c_t=c_t,
     )
 
 
@@ -1871,12 +1731,8 @@ def build_reservoir_preprocessing_artifacts(
     state_vertex_attrs: tuple[str, ...] = ("PRESSURE", "SWAT", "SGAS", "RS", "SOIL"),
     selected_steps=None,
     max_steps: int | None = None,
-    mu: float = 1.0,
-    c_t: float = 1.0,
-    rho: float = 1.0,
-    r_w: float = 0.1,
-    skin_default: float = 0.0,
-    g: float = 9.81,
+    r_w: float = ECLIPSE_DEFAULT_R_W,
+    skin_default: float = ECLIPSE_DEFAULT_SKIN,
     component_xtol: float = 1e-3,
     include_blackoil_tables: bool = False,
     include_aquifers: bool = False,
@@ -1896,7 +1752,7 @@ def build_reservoir_preprocessing_artifacts(
 
         stage_start = pd.Timestamp.now()
         rock_payload = extractor.load_rock()
-        rock_data = build_cell_rock_physics_from_payload(rock_payload, reservoir_mesh, mu=mu, c_t=c_t)
+        rock_data = build_cell_rock_physics_from_payload(rock_payload, reservoir_mesh)
         timings["rock_physics"] = float((pd.Timestamp.now() - stage_start).total_seconds())
 
         stage_start = pd.Timestamp.now()
@@ -1922,24 +1778,17 @@ def build_reservoir_preprocessing_artifacts(
     component_diagnostics = compute_component_diagnostics(reservoir_mesh, xtol=component_xtol)
     timings["component_diagnostics"] = float((pd.Timestamp.now() - stage_start).total_seconds())
 
+    # The per-cell states are what training supervises; the vertex projections
+    # below are only built for the attributes explicitly asked for.
     cell_states = {
         attr: np.asarray(state_data[attr], dtype=float)
-        for attr in state_vertex_attrs
+        for attr in dict.fromkeys((*state_attrs, *state_vertex_attrs))
         if attr in state_data
     }
     if "SOIL" in state_vertex_attrs and "SOIL" not in cell_states and "SWAT" in state_data and "SGAS" in state_data:
         cell_states["SOIL"] = np.asarray(1.0 - np.asarray(state_data["SWAT"], dtype=float) - np.asarray(state_data["SGAS"], dtype=float), dtype=float)
 
-    stage_start = pd.Timestamp.now()
-    vertex_states = {
-        attr: np.asarray(
-            cell_data_to_vertices(cell_states[attr], reservoir_mesh.cell_to_unique_vertices),
-            dtype=float,
-        )
-        for attr in state_vertex_attrs
-        if attr in cell_states
-    }
-    timings["cell_to_vertex_states"] = float((pd.Timestamp.now() - stage_start).total_seconds())
+    vertex_states: dict[str, np.ndarray] = {}     # the EDA-only vertex projections are not built
 
     stage_start = pd.Timestamp.now()
     well_metadata = prepare_well_metadata_from_payloads(
@@ -1947,11 +1796,8 @@ def build_reservoir_preprocessing_artifacts(
         summary_payload,
         reservoir_mesh,
         pd.to_datetime(state_data["dates"]),
-        rho=rho,
-        mu=mu,
         r_w=r_w,
         skin_default=skin_default,
-        g=g,
         cell_tensors=rock_data["cell_tensors"],
     )
     timings["well_metadata"] = float((pd.Timestamp.now() - stage_start).total_seconds())
@@ -2023,7 +1869,7 @@ def build_reservoir_preprocessing_artifacts(
         component_diagnostics=component_diagnostics,
         rock_payload=rock_payload,
         rock_data=rock_data,
-        state_payload=state_payload,
+        state_payload=None,   # state_data holds the snapshots the pipeline reads
         state_data=state_data,
         cell_states=cell_states,
         vertex_states=vertex_states,
@@ -2305,11 +2151,8 @@ def prepare_well_metadata_from_payloads(
     reservoir_mesh,
     selected_dates,
     allow_missing_wells: bool = True,
-    rho: float = 1.0,
-    mu: float = 1.0,
-    r_w: float = 0.1,
-    skin_default: float = 0.0,
-    g: float = 9.81,
+    r_w: float = ECLIPSE_DEFAULT_R_W,
+    skin_default: float = ECLIPSE_DEFAULT_SKIN,
     cell_tensors: np.ndarray | None = None,
 ) -> dict[str, Any]:
     segments = _attach_schedule_tables_to_segments(completion_payload)
@@ -2407,11 +2250,8 @@ def prepare_well_metadata_from_payloads(
                         p_bh=bhpt if np.isfinite(bhpt) else 0.0,
                         z_bh=z_bh if np.isfinite(z_bh) else z_cell,
                         z_cell=z_cell,
-                        rho=rho,
-                        mu=mu,
                         r_w=r_w_block,
                         skin=skin,
-                        g=g,
                     )
                     weight = float(peaceman["WI"])
                 except Exception:
@@ -2487,7 +2327,6 @@ def prepare_well_metadata_from_payloads(
                             "cell_idx": payload["cell_idx"],
                             "cell_vertices": payload["cell_vertices"],
                             "vertex_weights": payload["vertex_weights"],
-                            "q_coeff": float(peaceman["q_coeff"]),
                             "p_bh": float(bhpt),
                             "z_bh": float(payload["z_bh"]),
                             "z_cell": float(payload["z_cell"]),

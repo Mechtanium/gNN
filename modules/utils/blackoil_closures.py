@@ -229,97 +229,6 @@ def relperm_oil_3p(sw: jnp.ndarray, sg: jnp.ndarray, t: dict[str, jnp.ndarray]) 
 _SE_FLOOR = 1e-6
 
 
-def _seff(num: jnp.ndarray, den: jnp.ndarray) -> jnp.ndarray:
-    """Normalized effective saturation ``num/den`` clipped to [floor, 1]."""
-    return jnp.clip(num / jnp.maximum(den, _SE_FLOOR), _SE_FLOOR, 1.0)
-
-
-def corey_water(sw, s_wc, s_orw, krw_max, n_w):
-    r"""
-    Corey water relative permeability (Eq 3.10 family).
-
-    .. math::
-
-        k_{rw}(S_w) = k_{rw}^{\max}\, \left( \frac{S_w - S_{wc}}{1 - S_{wc} - S_{orw}} \right)^{n_w}
-
-    where:
-    - :math:`S_{wc}`: connate water saturation (zero-mobility endpoint).
-    - :math:`S_{orw}`: residual oil saturation to water (the other endpoint).
-    - :math:`k_{rw}^{\max}`: water endpoint relative permeability at :math:`S_w = 1 - S_{orw}`.
-    - :math:`n_w`: the Corey exponent (curvature).
-    """
-    se = _seff(sw - s_wc, 1.0 - s_wc - s_orw)
-    return krw_max * se ** n_w
-
-
-def corey_oil_water(sw, s_wc, s_orw, kro_max, n_ow):
-    r"""
-    Corey oil relative permeability in the oil-water system.
-
-    .. math::
-
-        k_{row}(S_w) = k_{ro}^{\max}\, \left( \frac{1 - S_w - S_{orw}}{1 - S_{wc} - S_{orw}} \right)^{n_{ow}}
-
-    where:
-    - :math:`k_{ro}^{\max}`: oil endpoint relative permeability at :math:`S_w = S_{wc}`.
-    - :math:`n_{ow}`: the oil-in-water Corey exponent (shared with :func:`corey_oil_gas`).
-    """
-    se = _seff(1.0 - sw - s_orw, 1.0 - s_wc - s_orw)
-    return kro_max * se ** n_ow
-
-
-def corey_gas(sg, s_wc, s_gc, s_org, krg_max, n_g):
-    r"""
-    Corey gas relative permeability (SGOF convention: :math:`S_w = S_{wc}`).
-
-    .. math::
-
-        k_{rg}(S_g) = k_{rg}^{\max}\, \left( \frac{S_g - S_{gc}}{1 - S_{wc} - S_{gc} - S_{org}} \right)^{n_g}
-
-    where:
-    - :math:`S_{gc}`: critical gas saturation (mobility onset).
-    - :math:`S_{org}`: residual oil saturation to gas.
-    - :math:`k_{rg}^{\max}, n_g`: gas endpoint relative permeability and Corey exponent.
-    """
-    se = _seff(sg - s_gc, 1.0 - s_wc - s_gc - s_org)
-    return krg_max * se ** n_g
-
-
-def corey_oil_gas(sg, s_wc, s_org, kro_max, n_og):
-    r"""
-    Corey oil relative permeability in the gas-oil system (SGOF convention).
-
-    .. math::
-
-        k_{rog}(S_g) = k_{ro}^{\max}\, \left( \frac{1 - S_{wc} - S_{org} - S_g}{1 - S_{wc} - S_{org}} \right)^{n_{og}}
-
-    where:
-    - :math:`k_{ro}^{\max}`: the shared oil endpoint (equal to :func:`corey_oil_water` at :math:`S_w = S_{wc}`, keeping the Stone-II endpoint :math:`k_{rc}` consistent).
-    - :math:`n_{og}`: the oil-in-gas Corey exponent.
-    """
-    se = _seff(1.0 - s_wc - s_org - sg, 1.0 - s_wc - s_org)
-    return kro_max * se ** n_og
-
-
-def brooks_corey_pc(s_wet, s_min, p_e, lam, se_floor: float = 0.05):
-    r"""
-    Brooks-Corey capillary pressure on the wetting-phase saturation.
-
-    .. math::
-
-        p_c(S) = p_e\, S_e^{-1/\lambda},
-        \qquad
-        S_e = \frac{S - S_{\min}}{1 - S_{\min}}
-
-    where:
-    - :math:`p_e`: the entry (displacement) pressure [psi].
-    - :math:`\lambda`: the pore-size-distribution index (larger = more uniform pores, flatter curve).
-    - :math:`S_e`: the effective wetting saturation, clipped to ``[se_floor, 1]`` so the curve stays bounded at the dry end (:math:`p_c \le p_e\, s_{\mathrm{floor}}^{-1/\lambda}`).
-    """
-    se = jnp.clip((s_wet - s_min) / jnp.maximum(1.0 - s_min, _SE_FLOOR), se_floor, 1.0)
-    return p_e * se ** (-1.0 / lam)
-
-
 # --------------------------------------------------------------------------- #
 # Capillary pressures                                                          #
 # --------------------------------------------------------------------------- #
@@ -398,11 +307,6 @@ def visc_water(pw: jnp.ndarray, t: dict[str, jnp.ndarray]) -> jnp.ndarray:
 # --------------------------------------------------------------------------- #
 # Surface densities                                                            #
 # --------------------------------------------------------------------------- #
-def surface_densities(t: dict[str, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """(rho_o,s, rho_w,s, rho_g,s) standard/surface densities (DENSITY table)."""
-    return t["dens_o"][0], t["dens_w"][0], t["dens_g"][0]
-
-
 # --------------------------------------------------------------------------- #
 # Per-phase mobility factor f_alpha = k_r,alpha / (mu_alpha * B_alpha).        #
 # --------------------------------------------------------------------------- #
@@ -445,54 +349,6 @@ def phase_factors(
     return jnp.stack([f_o, f_w, f_g], axis=0)
 
 
-def formation_volume_factors(
-    p_water: jnp.ndarray,
-    p_gas: jnp.ndarray,
-    rs: jnp.ndarray,
-    t: dict[str, jnp.ndarray],
-) -> jnp.ndarray:
-    """Return ``(B_o, B_w, B_g)`` stacked as ``(3, *state)`` for storage terms."""
-    return jnp.stack([fvf_oil(rs, t), fvf_water(p_water, t), fvf_gas(p_gas, t)], axis=0)
-
-
 # --------------------------------------------------------------------------- #
 # Total compressibility                                                        #
 # --------------------------------------------------------------------------- #
-def _table_slope(xp: jnp.ndarray, fp: jnp.ndarray) -> jnp.ndarray:
-    """Central-difference slope d(fp)/d(xp) evaluated on the table nodes."""
-    return jnp.gradient(fp, xp)
-
-
-def total_compressibility(
-    p_oil: jnp.ndarray,
-    p_water: jnp.ndarray,
-    p_gas: jnp.ndarray,
-    s_oil: jnp.ndarray,
-    s_water: jnp.ndarray,
-    s_gas: jnp.ndarray,
-    rs: jnp.ndarray,
-    t: dict[str, jnp.ndarray],
-    *,
-    mode: str = "full",
-) -> jnp.ndarray:
-    """Total compressibility c_t (Eqs 3.16, 2.112 practical form).
-
-    ``mode="full"``  : c_t = c_R + S_o c_o + S_w c_w + S_g c_g, with
-        c_w = pvtw_compr, c_R = ROCK, c_g = -(1/B_g) dB_g/dp,
-        c_o = -(1/B_o) dB_o/dp_bub mapped through the saturated R_s -> p_bub line.
-    ``mode="rock_water"`` : c_t = c_R + S_w c_w  (robust fallback).
-    """
-    c_r = t["rock_compr"]
-    c_w = t["pvtw_compr"][0]
-    if mode == "rock_water":
-        return c_r + s_water * c_w
-
-    bg = fvf_gas(p_gas, t)
-    dbg = _interp(p_gas, t["pvdg_pressure"], _table_slope(t["pvdg_pressure"], t["pvdg_fvf"]))
-    c_g = jnp.clip(-dbg / jnp.maximum(bg, 1e-12), 0.0, None)
-
-    bo = fvf_oil(rs, t)
-    dbo = _interp(rs, t["pvto_rs_sat"], _table_slope(t["pvto_pbub_sat"], t["pvto_fvf_sat"]))
-    c_o = jnp.clip(-dbo / jnp.maximum(bo, 1e-12), 0.0, None)
-
-    return c_r + s_oil * c_o + s_water * c_w + s_gas * c_g

@@ -962,11 +962,6 @@ def raw_modes(bundle: SpectralBundle):
     return bundle.v_nodes * bundle.v_std + bundle.v_mean
 
 
-def raw_centroid_modes(bundle: SpectralBundle):
-    """De-standardized centroid features (chain_rule Galerkin quadrature)."""
-    return bundle.v_c * bundle.v_std + bundle.v_mean
-
-
 def place_on_mesh(bundle: SpectralBundle, cfg: RunConfig, env: MeshEnv) -> SpectralBundle:
     """
     Device placement: chain_rule gathers a single row per collocation point, so

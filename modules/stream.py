@@ -167,9 +167,10 @@ def run_training(deck_bytes: bytes, deck_name: str, base: RunConfig, *, n_iter: 
         res = training.train(bundle, state, n_iter=step, log_every=10**9, stop_on_eta_zero=True)
         done = int(state.train_iter)
         h = state.hist
-        it = int(h["iter"][-1])
         comps = {g: float(h[g][-1]) for g in ("pde", "ic", "data", "well") if g in h and h[g]}
-        yield frames.loss(it, float(h["total"][-1]), comps.get("pde", 0.0), comps.get("ic", 0.0),
+        # ``done`` counts completed iterations (1..n_iter), which is what the page's
+        # progress bar and the snapshots' iteration stamp use; ``hist["iter"]`` is 0-based.
+        yield frames.loss(done, float(h["total"][-1]), comps.get("pde", 0.0), comps.get("ic", 0.0),
                           comps.get("data", 0.0), comps.get("well", 0.0),
                           wall_s=time.time() - t_start,
                           eta=(float(h["engd_eta"][-1]) if h.get("engd_eta") else None))

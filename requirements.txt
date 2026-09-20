@@ -16,6 +16,7 @@ protobuf
 opm-simulators==2026.4
 # The deck-table parser vendored under field/ needs these.
 anytree
+chardet
 numba
 h5py
 scikit-learn

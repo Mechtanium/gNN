@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+.venv
+output/
+work/
+docker/
+tests/
+*.joblib
+*.npz
+*.zip

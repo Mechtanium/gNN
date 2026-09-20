@@ -89,6 +89,8 @@ _OP_MASS = "operators_mass.npz"
 # eigenbasis-tier files (depend on N_EIG; column-sliceable)
 _EIG_META = "eigenbasis_meta.json"
 _EIG_DATA = "eigenbasis.npz"
+_POOL_DATA = "candidate_pool.npz"
+_POOL_META = "candidate_pool_meta.json"
 
 # entries of the ``build_static_hex_fem`` dict that are python scalars, not arrays
 _STATIC_SCALAR_KEYS = ("n_vertices", "n_hex", "n_degenerate")
@@ -375,3 +377,43 @@ def load_eig_cache(
             "upsilon": jnp.asarray(z["upsilon"][:n]),
             "n_eig_cached": stored,
         }
+
+
+def save_pool_cache(cache_dir: str | Path, op_key: dict[str, Any], *, ceiling: int,
+                    n_eig_z: int, lam_c: np.ndarray, v_cand: np.ndarray, ups_c: np.ndarray,
+                    n_forced: int, sel_key: dict[str, Any] | None = None) -> None:
+    r"""Persist the candidate pool the addressability floor is measured against.
+
+    The pool is a generalized eigensolve at ``ceiling`` width (``spec.n_eig_cap``);
+    on a mesh with degenerate eigenvalues the returned eigenvectors are only
+    defined up to a rotation inside each degenerate subspace, so two solves of
+    the same problem give *different* bases and, downstream, different losses.
+    Caching the pool makes every later run on the same deck reuse the identical
+    basis (and skips the most expensive step of resolution).
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_dir / _POOL_DATA, lam_c=np.asarray(lam_c), v_cand=np.asarray(v_cand),
+             ups_c=np.asarray(ups_c))
+    meta = {**op_key, **(sel_key or {}), "schema_version": SPECTRAL_CACHE_VERSION,
+            "ceiling": int(ceiling), "n_eig_z": int(n_eig_z), "n_forced": int(n_forced)}
+    (cache_dir / _POOL_META).write_text(json.dumps(meta, indent=2, sort_keys=True))
+
+
+def load_pool_cache(cache_dir: str | Path, op_key: dict[str, Any], *, ceiling: int,
+                    n_eig_z: int, sel_key: dict[str, Any] | None = None):
+    """The cached candidate pool as ``(lam_c, v_cand, ups_c, n_forced)``, or ``None``."""
+    cache_dir = Path(cache_dir)
+    meta_path, data_path = cache_dir / _POOL_META, cache_dir / _POOL_DATA
+    if not (meta_path.is_file() and data_path.is_file()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        return None
+    want = {**op_key, **(sel_key or {}), "schema_version": SPECTRAL_CACHE_VERSION,
+            "ceiling": int(ceiling), "n_eig_z": int(n_eig_z)}
+    if any(meta.get(k) != v for k, v in want.items()):
+        return None
+    with np.load(data_path) as z:
+        return z["lam_c"], z["v_cand"], z["ups_c"], int(meta["n_forced"])

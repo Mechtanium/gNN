@@ -703,9 +703,23 @@ def resolve_n_eig(cfg: RunConfig, case: CaseData) -> tuple[RunConfig, list[str]]
 
     probe = _dc_replace(cfg, n_eig=ceiling)
     n_z_top = resolve_n_eig_z(probe, n_levels)
-    lam_c, v_cand, ups_c, n_forced = _candidate_spectrum(
-        bundle.a_lap, bundle.m_lap, probe, int(case.n_nodes), int(bundle.n_null),
-        col_id, n_z_top, n_eig=ceiling)
+    # The pool is cached: eigenvectors of a degenerate spectrum are defined only up
+    # to a rotation per subspace, so re-solving would give a different basis (and
+    # different losses) on every run of the same deck.
+    import modules.utils.spectral_cache as sc
+
+    cache_dir, op_key, _ = _cache_locator(case, cfg)
+    sel_key = sc.eig_selection_key(cfg.spec)
+    pool = sc.load_pool_cache(cache_dir, op_key, ceiling=ceiling, n_eig_z=n_z_top, sel_key=sel_key)
+    if pool is None:
+        lam_c, v_cand, ups_c, n_forced = _candidate_spectrum(
+            bundle.a_lap, bundle.m_lap, probe, int(case.n_nodes), int(bundle.n_null),
+            col_id, n_z_top, n_eig=ceiling)
+        sc.save_pool_cache(cache_dir, op_key, ceiling=ceiling, n_eig_z=n_z_top,
+                           lam_c=lam_c, v_cand=v_cand, ups_c=ups_c, n_forced=n_forced,
+                           sel_key=sel_key)
+    else:
+        lam_c, v_cand, ups_c, n_forced = pool
     v_std_pool = (v_cand - v_cand.mean(axis=0)) / (v_cand.std(axis=0) + 1e-8)
     v_c_pool, _ = hf.centroid_features_and_gradients(v_std_pool, bundle.static)
     v_c_pool = onp.asarray(v_c_pool)

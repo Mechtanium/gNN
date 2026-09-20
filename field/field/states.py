@@ -6,7 +6,6 @@ import pandas as pd
 
 from .decorators import apply_to_each_input
 from .base_spatial import SpatialComponent
-from .plot_utils import show_slice_static, show_slice_interactive
 from .parse_utils import read_ecl_bin
 from .utils import get_single_path, get_multout_paths
 
@@ -169,33 +168,6 @@ class States(SpatialComponent):
             setattr(out, attr, data)
         out.set_state(**self.state.as_dict())
         return out
-
-    def show_slice(self, attr, t=None, i=None, j=None, k=None, figsize=None, **kwargs):
-        """Visualize slices of 4D states arrays. If no slice is specified, spatial slices
-        will be shown with interactive slider widgets.
-
-        Parameters
-        ----------
-        attr : str
-            Attribute to show.
-        t : int or None, optional
-            Timestamp to show.
-        i : int or None, optional
-            Slice along x-axis to show.
-        j : int or None, optional
-            Slice along y-axis to show.
-        k : int or None, optional
-            Slice along z-axis to show.
-        figsize : array-like, optional
-            Output plot size.
-        kwargs : dict, optional
-            Additional keyword arguments for plot.
-        """
-        if np.all([t is None, i is None, j is None, k is None]):
-            show_slice_interactive(self, attr, figsize=figsize, **kwargs)
-        else:
-            show_slice_static(self, attr, t=t, i=i, j=j, k=k, figsize=figsize, **kwargs)
-        return self
 
     def _read_buffer(self, path_or_buffer, attr, **kwargs):
         super()._read_buffer(path_or_buffer, attr, **kwargs)

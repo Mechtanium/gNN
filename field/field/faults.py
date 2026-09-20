@@ -5,7 +5,6 @@ import pandas as pd
 
 from .base_tree import BaseTree
 from .faults_load_utils import load_faults, load_multflt
-from .faults_dump_utils import write_faults, write_multflt
 from .decorators import apply_to_each_segment
 
 FACES = {'X': [1, 3, 5, 7], 'Y': [2, 3, 6, 7], 'Z': [4, 5, 6, 7]}
@@ -126,32 +125,3 @@ class Faults(BaseTree):
             return load_multflt(self, buffer, **kwargs)
         raise ValueError("Keyword {} is not supported in faults.".format(attr))
 
-    def _dump_ascii(self, path, attr, mode='w', **kwargs):
-        """Save data into text file.
-
-        Parameters
-        ----------
-        path : str
-            Path to output file.
-        attr : str
-            Attribute to dump into file.
-        mode : str
-            Mode to open file.
-            'w': write, a new file is created (an existing file with
-            the same name would be deleted).
-            'a': append, an existing file is opened for reading and writing,
-            and if the file does not exist it is created.
-            Default to 'w'.
-
-        Returns
-        -------
-        comp : Faults
-            Faults unchanged.
-        """
-        with open(path, mode) as f:
-            if attr.upper() == 'FAULTS':
-                write_faults(f, self)
-            elif attr.upper() == 'MULTFLT':
-                write_multflt(f, self)
-            else:
-                raise NotImplementedError("Dump for {} is not implemented.".format(attr.upper()))

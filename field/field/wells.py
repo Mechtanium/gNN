@@ -1,16 +1,12 @@
 """Wells components."""
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from anytree import PreOrderIter, PostOrderIter
 
 from .parse_utils.ascii import INT_NAN
 from .well_segment import WellSegment
 from .base_tree import BaseTree
-from .rates import show_rates, show_blocks_dynamics
 from .grids import OrthogonalGrid
-from .getting_wellblocks import get_wellblocks_vtk, get_wellblocks_compdat
-from .wells_dump_utils import write_perf, write_events, write_schedule, write_welspecs
 from .wells_load_utils import (load_rsm, load_ecl_binary, load_group, load_grouptree,
                                load_welspecs, load_welspecl, load_compdat, load_compdatl,
                                load_comdatmd, load_wconprod, load_wconinje, load_welltracks,
@@ -246,116 +242,6 @@ class Wells(BaseTree):
         return self
 
     @apply_to_each_segment
-    def get_blocks(self, segment, logger=None):
-        """Calculate grid blocks for the tree of wells.
-
-        Parameters
-        ----------
-        kwargs : misc
-            Any additional named arguments to append.
-
-        Returns
-        -------
-        comp : Wells
-            Wells component with calculated grid blocks and well in block projections.
-        """
-        grid = self.field.grid
-
-        if 'COMPDAT' in segment.attributes or 'COMPDATL' in segment.attributes:
-            if 'COMPDAT' in segment.attributes:
-                compdat = segment.compdat
-            elif (segment.compdatl['LGR']=='GLOBAL').all():
-                compdat = segment.compdatl
-            else:
-                logger.warning('Well {}: can not get blocks from COMPDATL data.'.format(segment.name))
-                return self
-
-            segment.blocks = get_wellblocks_compdat(compdat)
-            if isinstance(self.field.grid, OrthogonalGrid):
-                h_well = np.stack([(0, 0, self.field.grid.dz[i[0], i[1], i[2]])
-                                   for i in segment.blocks])
-            else:
-                h_well = np.full(segment.blocks.shape, np.nan)
-            segment.blocks_info = pd.DataFrame(h_well, columns=['Hx', 'Hy', 'Hz'])
-
-        else:
-            blocks, points, mds = get_wellblocks_vtk(segment.welltrack, grid)
-
-            segment.blocks = blocks
-            h_well = abs(points[:, 1] - points[:, 0])
-            segment.blocks_info = pd.DataFrame(h_well, columns=['Hx', 'Hy', 'Hz'])
-            segment.blocks_info['MDU'] = mds[:, 0]
-            segment.blocks_info['MDL'] = mds[:, 1]
-            segment.blocks_info['Enter_point'] = list(points[:, 0])
-            segment.blocks_info['Leave_point'] = list(points[:, 1])
-
-        segment.blocks_info = segment.blocks_info.assign(
-            PERF_RATIO=None if len(segment.blocks_info) == 0 else 0,
-            RAD=None if len(segment.blocks_info) == 0 else DEFAULTS['RAD'],
-            SKIN=None if len(segment.blocks_info) == 0 else DEFAULTS['SKIN'],
-            MULT=None if len(segment.blocks_info) == 0 else DEFAULTS['MULT'],
-        )
-        return self
-
-    def show_wells(self, figsize=None, c='r', **kwargs):
-        """Return 3D visualization of wells.
-
-        Parameters
-        ----------
-        figsize : tuple
-            Output figsize.
-        c : str
-            Line color, default red.
-        kwargs : misc
-            Any additional kwargs for plot.
-        """
-        fig = plt.figure(figsize=figsize)
-        ax = fig.add_subplot(111, projection='3d')
-        for segment in self:
-            arr = segment.welltrack
-            ax.plot(arr[:, 0], arr[:, 1], arr[:, 2], c=c, **kwargs)
-            ax.text(*arr[0, :3], s=segment.name)
-
-        ax.invert_zaxis()
-        ax.view_init(azim=60, elev=30)
-
-    def show_rates(self, timesteps=None, wellnames=None, wells2=None, labels=None, figsize=(16, 6)):
-        """Plot total or cumulative liquid and gas rates for a chosen node including branches.
-
-        Parameters
-        ----------
-        timesteps : list of Timestamps
-            Dates at which rates were calculated.
-        wellnames : array-like
-            List of wells to show.
-        figsize : tuple
-            Figsize for two axes plots.
-        wells2 : Wells
-            Target model to compare with.
-        """
-        timesteps = self.result_dates if timesteps is None else timesteps
-        wellnames = [node.name for node in PreOrderIter(self.root)]
-        return show_rates(self, timesteps=timesteps, wellnames=wellnames, wells2=wells2,
-                          labels=labels, figsize=figsize)
-
-    def show_blocks_dynamics(self, timesteps=None, wellnames=None, figsize=(16, 6)):
-        """Plot liquid or gas rates and pvt props for a chosen block of
-        a chosen well segment on two separate axes.
-
-        Parameters
-        ----------
-        timesteps : list of Timestamps
-            Dates at which rates were calculated.
-        wellnames : array-like
-            List of wells to plot.
-        figsize : tuple
-            Figsize for two axes plots.
-        """
-        timesteps = self.result_dates if timesteps is None else timesteps
-        wellnames = self.names if wellnames is None else wellnames
-        return show_blocks_dynamics(self, timesteps=timesteps, wellnames=wellnames, figsize=figsize)
-
-    @apply_to_each_segment
     def fill_na(self, segment, attr):
         """
         Fill nan values in wells segment attribute.
@@ -435,59 +321,3 @@ class Wells(BaseTree):
         """Load results from UNSMRY file."""
         return load_ecl_binary(self, *args, **kwargs)
 
-    def _dump_ascii(self, path, attr, mode='w', **kwargs):
-        """Save data into text file.
-
-        Parameters
-        ----------
-        path : str
-            Path to output file.
-        attr : str
-            Attribute to dump into file.
-        mode : str
-            Mode to open file.
-            'w': write, a new file is created (an existing file with
-            the same name would be deleted).
-            'a': append, an existing file is opened for reading and writing,
-            and if the file does not exist it is created.
-            Default to 'w'.
-
-        Returns
-        -------
-        comp : Wells
-            Wells unchanged.
-        """
-        with open(path, mode) as f:
-            if attr.upper() == 'WELLTRACK':
-                for node in self:
-                    if 'WELLTRACK' in node and 'COMPDAT' not in node and 'COMPDATL' not in node:
-                        f.write('WELLTRACK\t{}\n'.format(node.name))
-                        for line in node.welltrack:
-                            f.write(' '.join(line.astype(str)) + '\n')
-            elif attr.upper() == 'PERF':
-                write_perf(f, self, DEFAULTS)
-            elif attr.upper() == 'GROUP':
-                for node in PreOrderIter(self.root):
-                    if node.is_root:
-                        continue
-                    if node.ntype == 'group' and not node.is_leaf and not node.children[0].ntype == 'group':
-                        f.write(' '.join(['GROUP', node.name] +
-                                         [child.name for child in node.children]) + '\n')
-                f.write('/\n')
-            elif attr.upper() == 'GRUPTREE':
-                f.write('GRUPTREE\n')
-                for node in PreOrderIter(self.root):
-                    if node.is_root:
-                        continue
-                    if node.ntype == 'group' and node.parent.ntype == 'group':
-                        p_name = '1*' if node.parent.is_root else node.parent.name
-                        f.write(' '.join([node.name, p_name, '/\n']))
-                f.write('/\n')
-            elif attr.upper() == 'EVENTS':
-                write_events(f, self, VALUE_CONTROL)
-            elif attr.upper() == 'SCHEDULE':
-                write_schedule(f, self, **kwargs)
-            elif attr.upper() == 'WELSPECS':
-                write_welspecs(f, self)
-            else:
-                raise NotImplementedError("Dump for {} is not implemented.".format(attr.upper()))

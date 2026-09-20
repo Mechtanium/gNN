@@ -1,8 +1,6 @@
 """SpatialComponent class."""
 from copy import deepcopy
 import numpy as np
-import skimage
-from skimage.transform import rescale, resize
 import scipy
 
 from .base_component import BaseComponent
@@ -14,11 +12,6 @@ ACTIONS_DICT = {
     "clip": (np.clip, "numpy.clip", "array of cliped values"),
     "rot90": (np.rot90, "numpy.rot90", "rotated an array by 90 degrees in the plane specified by axes"),
     "gradient": (np.gradient, "numpy.gradient", "gradient"),
-    "resize": (resize, "skimage.transform.resize", "resize"),
-    "rescale": (rescale, "skimage.transform.rescale", "rescale"),
-    "crop": (skimage.util.crop, "crop", "cropped array by crop_width along each dimension"),
-    "random_noise": (skimage.util.random_noise, "random_noise",
-                     "array with added random noise of various types"),
 }
 
 @add_actions(extract_actions(scipy.ndimage), TEMPLATE_DOCSTRING)

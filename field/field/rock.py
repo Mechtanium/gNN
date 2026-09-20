@@ -1,10 +1,8 @@
 """Rock component."""
 import numpy as np
-import matplotlib.pyplot as plt
 
 from .base_spatial import SpatialComponent
 from .decorators import apply_to_each_input
-from .plot_utils import show_slice_static, show_slice_interactive
 from .utils import get_single_path
 from .parse_utils import read_ecl_bin
 
@@ -89,57 +87,3 @@ class Rock(SpatialComponent):
         stripped_data = data[actnum.ravel(order='F')]
         return stripped_data
 
-    def show_histogram(self, attr, **kwargs):
-        """Show properties distribution.
-
-        Parameters
-        ----------
-        attr : str
-            Attribute to compute the histogram.
-        kwargs : misc
-            Any additional named arguments to ``plt.hist``.
-
-        Returns
-        -------
-        plot : Histogram plot.
-        """
-        data = getattr(self, attr)
-        try:
-            actnum = self.field.grid.actnum
-            data = data * actnum
-        except AttributeError:
-            pass
-        plt.hist(data.ravel(), **kwargs)
-        plt.show()
-        return self
-
-    def show_slice(self, attr, i=None, j=None, k=None, figsize=None, **kwargs):
-        """Visualize slices of 3D array. If no slice is specified, all 3 slices
-        will be shown with interactive slider widgets.
-
-        Parameters
-        ----------
-        attr : str
-            Attribute to show.
-        i : int or None, optional
-            Slice along x-axis to show.
-        j : int or None, optional
-            Slice along y-axis to show.
-        k : int or None, optional
-            Slice along z-axis to show.
-        figsize : array-like, optional
-            Output plot size.
-        kwargs : dict, optional
-            Additional keyword arguments for plot.
-        """
-        data = getattr(self, attr)
-        try:
-            actnum = self.field.grid.actnum
-            data = data * actnum
-        except AttributeError:
-            pass
-        if np.all([i is None, j is None, k is None]):
-            show_slice_interactive(self, attr, figsize=figsize, **kwargs)
-        else:
-            show_slice_static(self, attr, i=i, j=j, k=k, figsize=figsize, **kwargs)
-        return self

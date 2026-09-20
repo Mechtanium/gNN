@@ -2,8 +2,6 @@
 from copy import deepcopy
 
 import numpy as np
-import vtk
-from vtkmodules.util.numpy_support import vtk_to_numpy
 
 from .decorators import cached_property, apply_to_each_input
 from .base_spatial import SpatialComponent
@@ -18,58 +16,12 @@ class Grid(SpatialComponent):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._vtk_grid = vtk.vtkUnstructuredGrid()
-        self._vtk_locator = None
         self._actnum_ids = None
         self.to_spatial()
         if 'MAPAXES' not in self:
             setattr(self, 'MAPAXES', np.array([0, 1, 0, 0, 1, 0]))
         if 'ACTNUM' not in self and 'DIMENS' in self:
             self.actnum = np.ones(self.dimens, dtype=bool)
-
-    @property
-    def vtk_grid(self):
-        """VTK unstructured grid."""
-        return self._vtk_grid
-
-    @property
-    def locator(self):
-        """VTK locator."""
-        if self._vtk_locator is None:
-            self.create_vtk_locator()
-        return self._vtk_locator
-
-    def create_vtk_grid(self):
-        """Creates VTK instructured grid."""
-        self._create_vtk_grid()
-        self._vtk_locator = None
-        return self
-
-    def create_vtk_locator(self):
-        """Creates VTK localor."""
-        self._vtk_locator = vtk.vtkModifiedBSPTree()
-        self._vtk_locator.SetDataSet(self.vtk_grid)
-        self._vtk_locator.AutomaticOn()
-        self._vtk_locator.BuildLocator()
-        return self
-
-    def _create_vtk_grid(self):
-        """Create vtk grid from points and connectivity arrays."""
-        points, conn = self.get_points_and_coonectivity()
-        cell_array = vtk.vtkCellArray()
-
-        for x in conn:
-            cell_array.InsertNextCell(8, x)
-
-        vtk_points = vtk.vtkPoints()
-        for i, point in enumerate(points):
-            vtk_points.InsertPoint(i, point)
-
-        self.vtk_grid.SetPoints(vtk_points)
-        self.vtk_grid.SetCells(vtk.vtkHexahedron().GetCellType(), cell_array)
-
-        self._actnum_ids = np.where(self.actnum.ravel())[0]
-        return self
 
     def get_points_and_coonectivity(self):
         """Get points and connectivity arrays."""
@@ -107,23 +59,6 @@ class Grid(SpatialComponent):
         """Grid axes origin relative to the map coordinates."""
         return np.array([self.mapaxes[2], self.mapaxes[3], self.tops.ravel()[0]])
 
-    @property
-    def cell_centroids(self):
-        """Centroids of cells."""
-        filt = vtk.vtkCellCenters()
-        filt.SetInputDataObject(self.vtk_grid)
-        filt.Update()
-        return vtk_to_numpy(filt.GetOutput().GetPoints().GetData())
-
-    @property
-    def cell_volumes(self):
-        """Volumes of cells."""
-        filt = vtk.vtkCellSizeFilter()
-        filt.ComputeVolumeOn()
-        filt.SetInputDataObject(self.vtk_grid)
-        filt.Update()
-        return vtk_to_numpy(filt.GetOutput().GetCellData().GetArray("Volume"))
-
     def to_corner_point(self):
         """Corner-point representation of the grid."""
         raise NotImplementedError()
@@ -136,8 +71,8 @@ class Grid(SpatialComponent):
     @cached_property
     def bounding_box(self):
         """Pair of diagonal corner points for grid's bounding box."""
-        bounds = self.vtk_grid.GetBounds()
-        return np.hstack([bounds[::2], bounds[1::2]])
+        xyz = self.xyz.reshape(-1, 3)
+        return np.hstack([xyz.min(axis=0), xyz.max(axis=0)])
 
     @property
     def ex(self):
@@ -209,7 +144,6 @@ class Grid(SpatialComponent):
             new_actnum = np.full(self.actnum.size, False)
             new_actnum[self.actnum_ids[mask]] = True
             self.actnum = new_actnum.reshape(self.dimens)
-            self.create_vtk_grid()
 
     @apply_to_each_input
     def _to_spatial(self, attr, **kwargs):
@@ -418,7 +352,6 @@ class OrthogonalGrid(Grid):
 
         grid = CornerPointGrid(dimens=self.dimens, mapaxes=self.mapaxes, actnum=self.actnum,
                                zcorn=zcorn.astype(float), coord=coord.astype(float))
-        grid.create_vtk_grid()
         return grid
 
     @cached_property

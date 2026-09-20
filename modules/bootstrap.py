@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -104,6 +105,24 @@ def setup_environment(
 
     jax.config.update("jax_enable_x64", want_x64)
     _CONFIGURED_POLICY = precision_policy
+
+
+def platforms_for_host(max_cpu_devices: int = 8) -> str:
+    """``"cuda,cpu"`` when an NVIDIA device is visible, else ``"cpu"`` — and on CPU
+    the XLA flag that splits the host into up to ``max_cpu_devices`` devices, so the
+    data-parallel mesh has something to shard over. ``JAX_PLATFORMS`` set by the
+    caller wins."""
+    forced = os.environ.get("JAX_PLATFORMS")
+    if forced:
+        return forced
+    has_gpu = Path("/dev/nvidia0").exists() or shutil.which("nvidia-smi") is not None
+    if has_gpu:
+        return "cuda,cpu"
+    n = max(1, min(max_cpu_devices, os.cpu_count() or 1))
+    flags = os.environ.get("XLA_FLAGS", "")
+    if "--xla_force_host_platform_device_count" not in flags:
+        os.environ["XLA_FLAGS"] = f"{flags} --xla_force_host_platform_device_count={n}".strip()
+    return "cpu"
 
 
 def env_summary() -> dict:

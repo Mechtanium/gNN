@@ -1,0 +1,21 @@
+# Runtime of the Delta-PINN workflow. The platform installs perd-worker[otel,page]
+# after this file, so the SDK's own pins (grpcio, protobuf) win any conflict.
+jax[cuda12]==0.10.0
+flax==0.12.7
+optax==0.2.8
+chex==0.1.92
+numpy
+scipy
+pandas
+joblib
+# ResInsight's Python client (must match the nightly setup.sh installs) and its transport.
+rips==2026.6.1.1
+grpcio
+protobuf
+# OPM Flow, the reference simulator, as a wheel.
+opm-simulators==2026.4
+# The deck-table parser vendored under field/ needs these.
+anytree
+numba
+h5py
+scikit-learn

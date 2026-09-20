@@ -123,9 +123,7 @@ def _validate_grid(model, grid):
             if tops_shape not in (dimens, dimens[:2]):
                 _raise_validation_error(model, "grid", "TOPS", f"{dimens} or {dimens[:2]}", tops_shape)
 
-    vtk_grid = getattr(grid, "vtk_grid", None)
-    if vtk_grid is not None and vtk_grid.GetNumberOfCells() == 0 and hasattr(grid, "create_vtk_grid"):
-        grid.create_vtk_grid()
+    vtk_grid = None            # the VTK grid is not built in this vendored parser
     if vtk_grid is not None:
         expected_cells = int(active_mask.sum())
         actual_cells = int(vtk_grid.GetNumberOfCells())

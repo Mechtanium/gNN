@@ -7,7 +7,6 @@ from ..base_component import BaseComponent
 from ..decorators import apply_to_each_input
 from ..parse_utils import read_table, TABLE_INFO
 from .table_interpolation import TABLE_INTERPOLATOR
-from ..plot_utils import plot_table_1d, plot_table_2d
 
 
 class Tables(BaseComponent):
@@ -211,19 +210,6 @@ class _Table(pd.DataFrame):  # pylint: disable=abstract-method
     @property
     def _constructor(self):
         return self.__class__
-
-    def plot(self, figsize=None):
-        """Plot table."""
-        if self.domain:
-            if len(self.domain) == 1:
-                plot_table_1d(self, figsize=figsize)
-            elif len(self.domain) == 2:
-                plot_table_2d(self, figsize=figsize)
-            else:
-                raise AttributeError('Can plot functions of 1 and 2 variables. Function of %d variables is given'
-                                     % len(self.domain))
-        else:
-            raise AttributeError('The table has no domain. Hence, can not be plotted!')
 
     def dump_ascii(self, path_or_buffer):
         """Dumps table to ASCII format."""

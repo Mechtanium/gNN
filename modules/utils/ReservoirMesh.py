@@ -1028,6 +1028,30 @@ def _spatialize_track(track: np.ndarray | None) -> np.ndarray | None:
     return track[:, :3]
 
 
+def _nearest_track_tangent(track: np.ndarray, point: np.ndarray) -> np.ndarray | None:
+    track = _spatialize_track(track)
+    if track is None or len(track) < 2:
+        return None
+    point = np.asarray(point, dtype=float).reshape(-1)
+    if point.shape[0] < 3:
+        return None
+    point = point[:3]
+    best_tangent = None
+    best_distance = np.inf
+    for start, end in zip(track[:-1], track[1:]):
+        direction = end - start
+        length_sq = float(np.dot(direction, direction))
+        if length_sq <= 1e-12:
+            continue
+        tau = np.clip(np.dot(point - start, direction) / length_sq, 0.0, 1.0)
+        closest = start + tau * direction
+        distance = float(np.linalg.norm(point - closest))
+        if distance < best_distance:
+            best_distance = distance
+            best_tangent = direction
+    return best_tangent
+
+
 def _block_path_tangents(block_centroids: np.ndarray) -> np.ndarray:
     tangents = np.zeros_like(block_centroids)
     if len(block_centroids) == 1:
@@ -1316,6 +1340,107 @@ def _merge_schedule_control_cache(target: dict[str, dict[str, list[dict[str, Any
         merged = target.setdefault(well_name, {"wconhist": [], "welopen": [], "wconprod": [], "wconinje": []})
         for table_name, rows in tables.items():
             merged.setdefault(table_name, []).extend(rows)
+
+
+def _extract_include_path(line: str) -> str | None:
+    """Extract a quoted include path from an Eclipse INCLUDE payload line."""
+    match = re.search(r"['\"]([^'\"]+)['\"]", line)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+def _parse_dates_line(line: str) -> pd.Timestamp:
+    """Parse a single DATES line and return its last explicit date."""
+    tokens = _tokenize_schedule_line(line)
+    if tokens and tokens[0].upper() == "DATES":
+        tokens = tokens[1:]
+    if len(tokens) < 3:
+        return pd.NaT
+
+    parsed_dates: list[pd.Timestamp] = []
+    for idx in range(0, len(tokens) - 2, 3):
+        maybe_date = _parse_eclipse_date(" ".join(tokens[idx : idx + 3]))
+        if pd.notna(maybe_date):
+            parsed_dates.append(maybe_date)
+    return parsed_dates[-1] if parsed_dates else pd.NaT
+
+def _parse_wconhist_row(line: str, current_date: pd.Timestamp) -> dict[str, Any] | None:
+    """Parse one WCONHIST row into a lightweight control record."""
+    tokens = _tokenize_schedule_line(line)
+    if len(tokens) < 3:
+        return None
+
+    values = _expand_eclipse_tokens(tokens[3:])
+    value1 = _parse_optional_float(values[0] if len(values) > 0 else None)
+    value2 = _parse_optional_float(values[1] if len(values) > 1 else None)
+    value3 = _parse_optional_float(values[2] if len(values) > 2 else None)
+    control = str(tokens[2]).upper()
+
+    rate = np.nan
+    bhpt = np.nan
+    phase = ""
+    if control == "ORAT":
+        rate = -abs(value1) if np.isfinite(value1) else np.nan
+        phase = "OIL"
+    elif control == "WRAT":
+        rate = -abs(value2) if np.isfinite(value2) else np.nan
+        phase = "WATER"
+    elif control == "GRAT":
+        rate = -abs(value3) if np.isfinite(value3) else np.nan
+        phase = "GAS"
+    elif control in {"LRAT", "RESV", "RATE"}:
+        raw_rate = value1 if np.isfinite(value1) else _record_float(
+            {"V1": value1, "V2": value2, "V3": value3},
+            ("V1", "V2", "V3"),
+        )
+        rate = -abs(raw_rate) if np.isfinite(raw_rate) else np.nan
+    elif control in {"BHP", "BHPT", "THP", "THPT"}:
+        bhpt = _record_float({"V1": value1, "V2": value2, "V3": value3}, ("V1", "V2", "V3"))
+
+    return {
+        "DATE": pd.to_datetime(current_date),
+        "WELL": str(tokens[0]).upper(),
+        "MODE": str(tokens[1]).upper(),
+        "CONTROL": control,
+        "RATE": rate,
+        "PHASE": phase,
+        "BHPT": bhpt,
+        "TARGET_1": value1,
+        "TARGET_2": value2,
+        "TARGET_3": value3,
+        "CONTROL_SOURCE": "WCONHIST",
+    }
+
+def _parse_welopen_row(line: str, current_date: pd.Timestamp) -> dict[str, Any] | None:
+    """Parse one WELOPEN row into a lightweight open/shut record."""
+    tokens = _tokenize_schedule_line(line)
+    if len(tokens) < 2:
+        return None
+    return {
+        "DATE": pd.to_datetime(current_date),
+        "WELL": str(tokens[0]).upper(),
+        "MODE": str(tokens[1]).upper(),
+        "CONTROL_SOURCE": "WELOPEN",
+    }
+
+def _parse_wconinje_row(line: str, current_date: pd.Timestamp) -> dict[str, Any] | None:
+    """Parse one WCONINJE row into a lightweight control record."""
+    tokens = _tokenize_schedule_line(line)
+    if len(tokens) < 2:
+        return None
+
+    values = _expand_eclipse_tokens(tokens[2:])
+    return {
+        "DATE": pd.to_datetime(current_date),
+        "WELL": str(tokens[0]).upper(),
+        "PHASE": str(tokens[1]).upper(),
+        "MODE": str(values[0]).upper() if len(values) > 0 and values[0] is not None else "",
+        "CONTROL": str(values[1]).upper() if len(values) > 1 and values[1] is not None else "",
+        "SPIT": _parse_optional_float(values[2] if len(values) > 2 else None),
+        "PIT": _parse_optional_float(values[2] if len(values) > 2 else None),
+        "BHPT": _parse_optional_float(values[4] if len(values) > 4 else None),
+        "CONTROL_SOURCE": "WCONINJE",
+    }
 
 
 def _parse_schedule_control_file(schedule_path: Path, start_date: pd.Timestamp) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -1613,6 +1738,28 @@ def _block_centroids_from_reservoir_mesh(block_indices: np.ndarray, reservoir_me
             block_centroids[idx] = block_centroids[nearest_valid]
 
     return block_centroids
+
+
+def _observed_phase_rates(result_snapshot: dict[str, float], total_rate: float) -> list[tuple[str, float]]:
+    """Per-phase surface rates implied by a well's summary observations.
+
+    Returns ``(phase, signed_surface_rate)`` pairs. Producers (``total_rate < 0``)
+    report withdrawal as negative rates from ``WOPR``/``WWPR``/``WGPR``; injectors
+    report injection as positive rates from ``WWIR``/``WGIR``. Phases whose
+    observed rate is missing or ~zero are dropped.
+    """
+    entries: list[tuple[str, float]] = []
+    if total_rate > 0.0:  # injector
+        for phase, key in (("WATER", "WWIR"), ("GAS", "WGIR")):
+            value = float(result_snapshot.get(key, np.nan))
+            if np.isfinite(value) and abs(value) > 0.0:
+                entries.append((phase, abs(value)))
+    else:  # producer (or unsigned)
+        for phase, key in (("OIL", "WOPR"), ("WATER", "WWPR"), ("GAS", "WGPR")):
+            value = float(result_snapshot.get(key, np.nan))
+            if np.isfinite(value) and abs(value) > 0.0:
+                entries.append((phase, -abs(value)))
+    return entries
 
 
 def _resolve_rate_phase_split(

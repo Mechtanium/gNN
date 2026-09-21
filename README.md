@@ -58,10 +58,12 @@ The work directory is `$DELTA_PINN_WORK` (default `/tmp/delta_pinn`), one folder
 ## Tests
 
 ```bash
-pytest tests -q                                   # message encoding (fast)
-RESINSIGHT_EXECUTABLE=… DELTA_PINN_DECK=… pytest tests -q -m slow   # deck → Flow → ResInsight → 5 quick iterations
+pytest tests -q                                   # message encoding, OPM Flow on SPE1 (twice in one process), every referenced name defined
+RESINSIGHT_EXECUTABLE=… pytest tests -q -m slow   # SPE1 deck → Flow → ResInsight → 5 quick iterations (DELTA_PINN_DECK= for another deck)
 DECK=… RESINSIGHT_LOCAL_ZIP=… tests/test_resinsight_container.sh    # the image recipe in docker, as uid 10001
 ```
+
+`tests/data` vendors two open decks: SPE1CASE1 (OPM's, ODbL; 300 cells, `DATES`/`WCONINJE` blocks) and SPE-2 (9 375 cells). They cover different parser branches — a helper the trim had deleted (`_parse_wconinje_row`) was invisible on SPE-2 and fatal on SPE1, which is what `tests/test_static.py` now guards.
 
 [tests/parity](tests/parity) holds the developer scripts that prove the extracted pipeline is bit-identical to the research notebook's.
 

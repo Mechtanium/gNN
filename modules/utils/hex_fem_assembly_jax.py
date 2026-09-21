@@ -141,6 +141,33 @@ def canonical_hexes_from_corner_cells(
     return np.take_along_axis(hexes, pick, axis=1)
 
 
+def canonicalize_hex_order(verts: np.ndarray, hexes: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Reorder each hex's 8 nodes into the canonical VTK ordering of the reference cube.
+
+    ``reservoir_mesh.corner_cells`` / ``cell_to_unique_vertices`` do **not** use one
+    fixed corner ordering across cells, so a fixed reference element is invalid as
+    given.  For an axis-aligned grid each corner is unambiguously placed in the
+    ``{0,1}^3`` lattice by the sign of its coordinate relative to the cell centroid
+    along the global x/y/z axes; we use that to rebuild a consistent connectivity.
+
+    Returns the reordered ``(n_hex, 8)`` connectivity and a ``bool`` that is
+    ``True`` iff every cell's 8 corners mapped bijectively onto the 8 lattice
+    slots (i.e. the cells are axis-aligned boxes, as in SPE1CASE1).
+    """
+    verts = np.asarray(verts, dtype=np.float64)
+    hexes = np.asarray(hexes, dtype=np.int64)
+    coords = verts[hexes]                                   # (n_hex, 8, 3)
+    centroid = coords.mean(axis=1, keepdims=True)           # (n_hex, 1, 3)
+    bits = (coords > centroid).astype(np.int64)             # (n_hex, 8, 3)
+    codes = bits[..., 0] + 2 * bits[..., 1] + 4 * bits[..., 2]   # (n_hex, 8)
+    slots = _CODE_TO_SLOT[codes]                            # (n_hex, 8)
+    out = np.zeros_like(hexes)
+    np.put_along_axis(out, slots, hexes, axis=1)
+    # Bijective iff each row's slots are a permutation of 0..7.
+    bijective = bool(np.all(np.sort(slots, axis=1) == np.arange(8)[None, :]))
+    return out, bijective
+
+
 def build_static_hex_fem(
     verts: np.ndarray,
     hexes: np.ndarray,

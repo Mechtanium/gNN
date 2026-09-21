@@ -1036,7 +1036,7 @@ class WellOps:
 
 def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
                        centroids, eff_tables: Callable | None = None,
-                       wi_mult_of: Callable | None = None, head: WellHead | None = None) -> WellOps:
+                       wi_mult_of: Callable | None = None, head: Any | None = None) -> WellOps:
     r"""
     Build the well surfaces: ``well_arr(params) -> rows`` (scaled observation
     residual array for the ``well`` group), ``well_predict(params) -> (p_bh, q_hat)``
@@ -1054,13 +1054,11 @@ def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
     tables0 = case.tables
     eff = eff_tables if eff_tables is not None else (lambda params: tables0)
     kr_floor = float(cfg.kr_floor)
-    predicted = False
 
     ci = jnp.asarray(pack.cell_idx, jnp.int32)
     enc_args = encoder.gather_args(ci)
     cxyz = centroids[ci]                                            # (n_perf, 3)
     times = jnp.asarray(pack.times, jnp.float32)
-    wid = jnp.asarray(pack.well_id, jnp.int32)
 
     # static row gathers from the mode-resolved masks
     bhp_sel = onp.nonzero(pack.bhp_row_mask.ravel() > 0)[0]
@@ -1104,100 +1102,19 @@ def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
             r_ch = r_ch * boost
         return r_ch
 
-    if not predicted:
-        def _predict(params):
-            P4 = _perf_primaries(params)
-            return _closure_core(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params))
-
-        def well_predict(params):
-            p_bh_hat, q_hat, p_bh_used = _predict(params)
-            return p_bh_used, q_hat
-
-        def well_arr(params):
-            p_bh_hat, q_hat, _ = _predict(params)
-            r_bhp = (p_bh_hat.reshape(-1)[bhp_sel] - bhp_obs_flat) / s_bhp
-            return jnp.concatenate([r_bhp, _ch_rows(q_hat)])
-
-        return WellOps(well_arr=well_arr, well_predict=well_predict)
-
-    # ---------------- predicted well model ------------------------------------------------
-    active = jnp.asarray(pack.active, jnp.float32)                   # (T, W)
-    is_inj_perf = jnp.asarray(pack.is_inj, jnp.float32)[:, wid]      # (T, n_perf)
-    inj_ph_perf = jnp.asarray(pack.inj_phase, jnp.int32)[:, wid]
-    rate_sel = onp.nonzero(pack.ctrl_rate_mask.ravel() > 0)[0]
-    bhp_c_sel = onp.nonzero(pack.ctrl_bhp_mask.ravel() > 0)[0]
-    lim_sel = onp.nonzero(pack.ctrl_limit_mask.ravel() > 0)[0]
-    ctrl_ph_flat = jnp.asarray(pack.ctrl_phase.ravel(), jnp.int32)
-    q_ctrl_flat = jnp.asarray(pack.q_ctrl.ravel(), jnp.float32)
-    p_lim_flat = jnp.asarray(pack.p_bh_ctrl.ravel(), jnp.float32)
-    s_q = jnp.asarray([s_qo, s_qw, s_qg], jnp.float32)
-    s_qc_flat = s_q[ctrl_ph_flat]
-    sgn_flat = jnp.where(q_ctrl_flat > 0, -1.0, 1.0).astype(jnp.float32)   # producers +1
-    hinge = cfg.ctrl_switch == "hinge"
-
-    def _state_T(params):
-        P4 = _perf_primaries(params)
-        return _perf_state(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params),
-                           is_inj=is_inj_perf.astype(P4.dtype), inj_phase=inj_ph_perf)
-
     def _predict(params):
-        state = _state_T(params)
-        p_wf = head.pwf(params["well"]).astype(state[2].dtype)
-        q_hat, _ = predicted_head(state, p_wf, pack, case, active=active)
-        return p_wf, q_hat
+        P4 = _perf_primaries(params)
+        return _closure_core(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params))
 
     def well_predict(params):
-        return _predict(params)
+        p_bh_hat, q_hat, p_bh_used = _predict(params)
+        return p_bh_used, q_hat
 
     def well_arr(params):
-        p_wf, q_hat = _predict(params)
-        r_bhp = (p_wf.reshape(-1)[bhp_sel] - bhp_obs_flat) / s_bhp
+        p_bh_hat, q_hat, _ = _predict(params)
+        r_bhp = (p_bh_hat.reshape(-1)[bhp_sel] - bhp_obs_flat) / s_bhp
         return jnp.concatenate([r_bhp, _ch_rows(q_hat)])
 
-    def ctrl_parts(params):
-        p_wf, q_hat = _predict(params)
-        p_flat = p_wf.reshape(-1)
-        q_c = jnp.take_along_axis(q_hat.reshape(-1, 3), ctrl_ph_flat[:, None], axis=1)[:, 0]
-        r_rate = (q_c - q_ctrl_flat) / s_qc_flat
-        r_bhp = (p_flat - p_lim_flat) / s_bhp
-        a = sgn_flat * (p_flat - p_lim_flat) / s_bhp
-        b = (jnp.abs(q_ctrl_flat) - jnp.abs(q_c)) / s_qc_flat
-        return {"rate": r_rate, "bhp": r_bhp, "a": a, "b": b,
-                "fb": fischer_burmeister(a, b), "hinge": jnp.maximum(0.0, -a)}
-
-    def ctrl_arr(params):
-        parts = ctrl_parts(params)
-        rows = [parts["rate"][rate_sel], parts["bhp"][bhp_c_sel]]
-        if lim_sel.size:
-            rows.append((parts["hinge"] if hinge else parts["fb"])[lim_sel])
-        return jnp.concatenate(rows)
-
-    # the interior source at an arbitrary collocation time
-    is_inj_tab = jnp.asarray(pack.is_inj, jnp.float32)
-    inj_ph_tab = jnp.asarray(pack.inj_phase, jnp.int32)
-    act_tab = active
-
-    def rates_at(params, t):
-        t32 = jnp.asarray(t, jnp.float32)
-        xt = jnp.concatenate([cxyz, jnp.full((cxyz.shape[0], 1), t32, cxyz.dtype)], axis=1)
-        P4 = vmap(lambda x, *a: prim.primaries_point(params, x, *a))(xt, *enc_args)  # (n_perf, 4)
-        inj = _nearest_row(times, is_inj_tab, t32)[wid].astype(P4.dtype)
-        inj_ph = _nearest_row(times, inj_ph_tab, t32)[wid]
-        state = _perf_state(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params),
-                            is_inj=inj, inj_phase=inj_ph)
-        p_wf = head.pwf_at(params["well"], t32).astype(P4.dtype)
-        act = _nearest_row(times, act_tab, t32).astype(P4.dtype)
-        _, q_perf = predicted_head(state, p_wf, pack, case, active=act)
-        return q_perf                                                 # (n_perf, 3) residual order
-
-    cent = onp.asarray(case.centroids)
-    cell_len = onp.asarray(case.cell_len)
-    forcing = PredictedForcing(
-        times=times, q_perf=None,
-        perf_xyz=jnp.asarray(cent[pack.cell_idx], jnp.float32),
-        perf_sigma=jnp.asarray(cell_len[pack.cell_idx], jnp.float32),
-        rates_at=rates_at)
-    return WellOps(well_arr=well_arr, well_predict=well_predict, ctrl_arr=ctrl_arr,
-                   forcing=forcing, ctrl_parts=ctrl_parts)
+    return WellOps(well_arr=well_arr, well_predict=well_predict)
 
 

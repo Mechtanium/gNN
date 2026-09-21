@@ -1,4 +1,4 @@
-r"""The Delta-PINN training pipeline, extracted from PINN-Lab for the PERD workflow.
+r"""The gNN training pipeline, extracted from PINN-Lab for the PERD workflow.
 
 The composition is fixed to the notebook's gold standard — spectral encoding,
 DGM, spectral PDE residual with FEM-nodal backprop, permeability-weighted

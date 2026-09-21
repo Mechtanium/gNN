@@ -1,4 +1,4 @@
-# Runtime of the Delta-PINN workflow. The platform installs perd-worker[otel,page]
+# Runtime of the gNN workflow. The platform installs perd-worker[otel,page]
 # after this file, so the SDK's own pins (grpcio, protobuf) win any conflict.
 jax[cuda12]==0.10.0
 flax==0.12.7

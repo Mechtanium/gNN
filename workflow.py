@@ -1,10 +1,10 @@
-"""Delta-PINN as a PERD workflow: a reservoir deck in, a trained history-matching
+"""gNN as a PERD workflow: a reservoir deck in, a trained history-matching
 PINN out, with the losses and the cell states streaming while it trains.
 
 The single operation, ``train``, takes an Eclipse ``.DATA`` deck as a stream of
 byte chunks and a few run parameters, then runs the reference simulation (OPM
 Flow), extracts the grid, states and wells through ResInsight, builds the
-Delta-PINN pipeline and trains it with the notebook's gold-standard
+gNN pipeline and trains it with the notebook's gold-standard
 configuration (or the deck-sized QUICK preset). Every output item is one
 message: a ``stage`` update, the ``grid`` geometry, a ``loss`` per iteration, a
 ``state`` snapshot of the seven cell fields at one report time, or the final
@@ -38,7 +38,7 @@ async def train(
     snapshot_every: int = 50,
     n_snapshots: int = 8,
 ) -> WorkflowStreamOutput[str, int, float, float, float, float, float, str]:
-    """Train the Delta-PINN on one Eclipse deck and stream the run.
+    """Train the gNN on one Eclipse deck and stream the run.
 
     ``chunks`` is the deck file in pieces (any size). ``preset`` is ``"gold"`` (the
     notebook's configuration, meant for a GPU) or ``"quick"`` (the same physics

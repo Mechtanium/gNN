@@ -3,7 +3,7 @@ r"""Generalized eigenbasis of the hexahedral FEM operators ``A v = lambda M v``.
 Given the trilinear-hexahedral stiffness ``A`` and consistent-mass ``M`` operators
 assembled by :mod:`hex_fem_assembly_jax`, this module extracts the leading
 generalized eigenpairs that define the spectral (Laplace-eigenfunction) positional
-encoding of the Delta-PINN. The generalized eigenproblem is
+encoding of the gNN. The generalized eigenproblem is
 
 .. math::
 

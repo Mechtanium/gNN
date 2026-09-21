@@ -2,7 +2,7 @@
 import json, os, sys, time
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-sys.path.insert(0, "/home/enosmath/PERD/Delta-PINN")
+sys.path.insert(0, "/home/enosmath/PERD/gNN")
 from modules import bootstrap
 bootstrap.setup_environment("selective_f64", True, platforms="cpu")
 # The research repo's prep cache pickles its classes as utils.<module>.<Class>;
@@ -17,7 +17,7 @@ from modules import pipeline, training
 from modules.config import *
 
 cfg = RunConfig(
-    deck_path="/home/enosmath/Flintstone/Delta-PINNs/data/spe2-cartesian/equispaced/SPE-2-cartesian-equi.DATA",
+    deck_path="/home/enosmath/Flintstone/gNNs/data/spe2-cartesian/equispaced/SPE-2-cartesian-equi.DATA",
     work_dir=sys.argv[2],
     input_encoding=InputEncoding.SPECTRAL, architecture=Architecture.DGM,
     residual_design=ResidualDesign.SPECTRAL_PDE, backprop_design=BackpropDesign.FEM_NODAL,

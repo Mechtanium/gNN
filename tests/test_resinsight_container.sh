@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${DECK:?set DECK to an Eclipse .DATA file}"
-TAG=${TAG:-delta-pinn-recipe:test}
+TAG=${TAG:-gNN-recipe:test}
 ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
 cp setup.sh tests/container_probe.py "$ctx/"
 local_zip=""

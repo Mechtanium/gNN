@@ -15,7 +15,7 @@
 # a release asset and the checksum is what makes the build reproducible.
 set -euo pipefail
 
-RESINSIGHT_URL="${RESINSIGHT_URL:-https://github.com/Mechtanium/Delta-PINN/releases/download/resinsight-2026.07/ResInsight-Ubuntu-24.04-gcc.zip}"
+RESINSIGHT_URL="${RESINSIGHT_URL:-https://github.com/Mechtanium/gNN/releases/download/resinsight-2026.07/ResInsight-Ubuntu-24.04-gcc.zip}"
 RESINSIGHT_FALLBACK_URL="https://nightly.link/OPM/ResInsight/workflows/ResInsightWithCache/dev/ResInsight-Ubuntu%2024.04%20gcc.zip"
 RESINSIGHT_SHA256="${RESINSIGHT_SHA256:-c49e2331b2eec0b5616528e0ed060ac715e790edceb50aa7bf71411b18d47be1}"
 RESINSIGHT_LOCAL_ZIP="${RESINSIGHT_LOCAL_ZIP:-}"   # tests: skip the download

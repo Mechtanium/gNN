@@ -1,4 +1,4 @@
-# Delta-PINN — a PERD workflow
+# gNN — a PERD workflow
 
 A physics-informed neural network for **reservoir history matching**. The black-oil balances of a field are enforced through a spectral (Laplace-eigenfunction) residual on the reservoir's own hexahedral grid while the simulator's cell states and the wells' observed rates supervise the network. The only input is one Eclipse deck; from it the workflow runs the reference simulation (OPM Flow), extracts the grid, rock, cell states and wells through ResInsight, builds the finite-element operators and the eigenbasis, and trains — streaming the losses and the predicted cell states to the app page as it goes.
 

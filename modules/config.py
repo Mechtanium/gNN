@@ -1,5 +1,5 @@
 r"""
-Component configuration for the Delta-PINN workflow.
+Component configuration for the gNN workflow.
 
 The composition is the notebook's gold standard and is fixed: spectral input
 encoding, the DGM architecture, the spectral (Galerkin) PDE residual with

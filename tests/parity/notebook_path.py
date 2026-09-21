@@ -2,7 +2,7 @@
 import json, os, sys, time
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-sys.path.insert(0, "/home/enosmath/Flintstone/Delta-PINNs")
+sys.path.insert(0, "/home/enosmath/Flintstone/gNNs")
 from pinnlab import bootstrap
 bootstrap.setup_environment("selective_f64", True, platforms="cpu")
 import numpy as np

@@ -1,4 +1,4 @@
-"""The Delta-PINN app page: settings and the deck on the left, the reservoir in
+"""The gNN app page: settings and the deck on the left, the reservoir in
 3-D on the top right, the loss curves below it — the ResInsight layout.
 
 Everything the page shows comes from the messages ``workflow.train`` streams:
@@ -33,7 +33,7 @@ def grid_dims(run):
     return None
 
 
-pl.title("Delta-PINN")
+pl.title("gNN")
 pl.markdown(
     "A physics-informed neural network for **reservoir history matching**: the black-oil "
     "balances of a field are enforced through a spectral (Laplace-eigenfunction) residual "

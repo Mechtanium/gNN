@@ -4,7 +4,7 @@ This is the 8-node (trilinear) hexahedral FEM assembler.  It is used by
 ``Laplace-DGM-PINN.ipynb`` to
 
   1. build the **fixed** Laplace eigenproblem ``A v = lambda M v`` whose lowest
-     eigenfunctions become the spectral positional encoding (Delta-PINN), and
+     eigenfunctions become the spectral positional encoding (gNN), and
   2. assemble the **state-dependent** per-phase stiffness ``K_alpha`` used by the
      ``fem_nodal`` black-oil residual.
 

@@ -1,0 +1,4 @@
+# What this workflow asks of the PERD platform. Read by the build; the class
+# is fixed per version and shown (never chosen) at launch.
+[compute]
+class = "gpu_t4"    # 4 vCPU / 16 GiB + 1x NVIDIA T4; the gold preset trains here

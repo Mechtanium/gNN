@@ -40,7 +40,7 @@ The two presets are in [modules/presets.py](modules/presets.py). **Gold** is the
 
 ## Publishing it on PERD
 
-Push this repository to GitHub, sign in on the PERD website, open **Store → Publish from GitHub**, paste the URL and choose the workflow id. The image build runs [setup.sh](setup.sh) as root before the Python installs — that script is where every ResInsight detail lives (the Debian libraries the binary needs, the pinned nightly zip verified by SHA-256, the `xvfb` wrapper `rips` launches, a writable `HOME` for the non-root user); the platform knows nothing about ResInsight. The image is about 5 GB (JAX CUDA, ResInsight, OPM Flow), so give the build a 3600 s timeout and an 8-vCPU machine. Launch the app on the **GPU T4** class with a three-day lease for gold runs; the quick preset runs on any class.
+Push this repository to GitHub, sign in on the PERD website, open **Store → Publish from GitHub**, paste the URL and choose the workflow id. The image build runs [setup.sh](setup.sh) as root before the Python installs — that script is where every ResInsight detail lives (the Debian libraries the binary needs, the pinned nightly zip verified by SHA-256, the `xvfb` wrapper `rips` launches, a writable `HOME` for the non-root user); the platform knows nothing about ResInsight. The image is about 5 GB (JAX CUDA, ResInsight, OPM Flow), so give the build a 3600 s timeout and an 8-vCPU machine. The repository declares the **GPU T4** compute class in [perd.toml](perd.toml) — the build reads it and every workstation running this workflow is sized from it, so the launch dialog shows the class rather than asking for it. Launch the app with a three-day lease for gold runs; the quick preset runs on the same machine in minutes.
 
 The ResInsight zip is a release asset of this repository (`resinsight-2026.07`), never a git object; `setup.sh` falls back to the nightly link if the asset is missing and refuses anything whose checksum differs.
 
@@ -75,6 +75,7 @@ DECK=… RESINSIGHT_LOCAL_ZIP=… tests/test_resinsight_container.sh    # the im
 - `modules/utils/` — the mesh, the extractor (rips backend), the preprocessing cache, the black-oil closures, the FEM assembly and the eigenbasis.
 - `field/` — the vendored deck-table parser, trimmed to what the extractor needs.
 - `setup.sh`, `requirements.txt` — the image recipe.
+- `perd.toml` — what the workflow asks of the platform: `[compute] class = "gpu_t4"`.
 
 ## License
 

@@ -23,7 +23,7 @@ FIELD_LABELS = {
     "p_g": "Gas pressure (p_g) [psia]",
     "R_so": "Dissolved gas ratio (R_so) [Mscf/stb]",
 }
-PRESETS = {"Quick (CPU, deck-sized)": "quick", "Gold (GPU, notebook config)": "gold"}
+PRESETS = {"Quick (CPU, deck-sized)": "quick", "Live run (GPU, slow)": "gold"}
 
 
 # ── Left pane: run settings and the deck ────────────────────────────────

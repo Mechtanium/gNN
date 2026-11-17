@@ -15,7 +15,7 @@ so the AD tape is unchanged and only the elementwise moment update runs at
 ``value_and_grad_from_state`` (the accepted point's value/grad pair is reused —
 no extra objective evaluation per step); its curvature memory is restarted at
 every supervision-window boundary so it never spans two windows. The ENGD
-phase is stateless (see :mod:`pinnlab.engd`).
+phase is stateless (see :mod:`modules.engd`).
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def phase_of(cfg: RunConfig, it: int) -> str:
 class Steps:
     r"""Jitted training steps + state initializers for one configured run.
 
-    ``special_reset_on_window`` controls whether :func:`pinnlab.training.train`
+    ``special_reset_on_window`` controls whether :func:`modules.training.train`
     re-initializes ``opt_state`` from ``special_init`` when a new supervision
     window opens (the optimizer hand-off always initializes, independently of
     this flag). The default ``True`` is the L-BFGS convention: a quasi-Newton
@@ -48,12 +48,12 @@ class Steps:
     A stochastic optimizer inverts that argument. When the window is redrawn
     every iteration, the accumulated direction is the *only* thing carrying
     information across samples, and re-initializing it each refresh erases the
-    method — so :func:`pinnlab.pipeline.with_spring` sets this ``False``.
+    method — so :func:`modules.pipeline.with_spring` sets this ``False``.
 
     where:
 
     - ``special_init``: fresh special-optimizer state from the current params (``None`` for stateless plain ENGD, so the flag is inert there).
-    - ``special_kind``: the configured :class:`~pinnlab.config.SpecialOpt`; unchanged by the pipeline wrappers, which all require ENGD.
+    - ``special_kind``: the configured :class:`~modules.config.SpecialOpt`; unchanged by the pipeline wrappers, which all require ENGD.
     """
 
     train_step_adam: Callable | None       # (params, opt_state, w, win) -> (params, ost, val, comps)
@@ -89,10 +89,14 @@ def make_train_steps(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
     skip_adam = cfg.special_opt is not SpecialOpt.NONE and cfg.special_opt_after == 0
     tx_adam = None if skip_adam else optax.adam(
         optax.exponential_decay(cfg.lr0, cfg.lr_decay_steps, cfg.lr_decay))
+    tx_lbfgs = (optax.lbfgs(memory_size=cfg.lbfgs_mem)
+                if cfg.special_opt is SpecialOpt.LBFGS else None)
 
     abstract_opt: dict = {}
     if tx_adam is not None:
         abstract_opt["adam"] = jax.eval_shape(lambda p: tx_adam.init(as_master(p)), params0)
+    if tx_lbfgs is not None:
+        abstract_opt["lbfgs"] = jax.eval_shape(lambda p: tx_lbfgs.init(as_master(p)), params0)
     opt_shardings = {n: shard_like_params(env, model_bundle.pspec_of_shape, a)
                      for n, a in abstract_opt.items()}
 
@@ -114,7 +118,19 @@ def make_train_steps(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
 
     train_step_special = None
     special_init = None
-    if cfg.special_opt is SpecialOpt.ENGD:
+    if cfg.special_opt is SpecialOpt.LBFGS:
+        @jax.jit
+        def train_step_special(params, opt_state, w, win):
+            params = _wsc(params)
+            vfn = lambda p: loss_fn(as_f32(p), w, win)[0]
+            val, grads = optax.value_and_grad_from_state(vfn)(params, state=opt_state)
+            updates, opt_state = tx_lbfgs.update(grads, opt_state, params,
+                                                 value=val, grad=grads, value_fn=vfn)
+            params = optax.apply_updates(params, updates)
+            return params, opt_state, val, None
+
+        special_init = jax.jit(tx_lbfgs.init)
+    elif cfg.special_opt is SpecialOpt.ENGD:
         from .engd import make_engd_step
 
         train_step_special = make_engd_step(cfg, resolved, loss_fn, rows_fn, model_bundle, env)
@@ -125,11 +141,15 @@ def make_train_steps(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
         return loss_fn(as_f32(params), w, win)
 
     phase0 = phase_of(cfg, 0)
+    kind0 = ("adam" if phase0 == "adam"
+             else ("lbfgs" if cfg.special_opt is SpecialOpt.LBFGS else "engd"))
 
     def opt_init(params):
         params = as_master(jax.device_put(params, param_shardings))
-        if phase0 == "adam":
+        if kind0 == "adam":
             return params, tx_adam.init(params), phase0
+        if kind0 == "lbfgs":
+            return params, tx_lbfgs.init(params), phase0
         return params, (), phase0   # ENGD: stateless
 
     return Steps(

@@ -1142,15 +1142,25 @@ def compute_qw_full_tensor(
     }
 
 
+# Summary files stamp each row with the elapsed time in float32 days, whose rounding is about
+# 6e-8 of the elapsed time (5 s at day 900); a row is matched to a report date within this
+# relative tolerance, far below the shortest report step.
+_SUMMARY_TIME_RTOL = 1e-7
+
+
 def _latest_schedule_row(table: Any, current_date: pd.Timestamp) -> pd.Series | None:
-    """Return the latest dated schedule row not newer than the requested timestamp."""
+    """Return the latest dated row not newer than the requested timestamp, a row stamped a
+    rounding error after it included (``_SUMMARY_TIME_RTOL``): otherwise a summary row written
+    at the report time but stamped a few seconds late would be passed over for the previous
+    report step's."""
     if table is None or len(table) == 0:
         return None
     if not hasattr(table, "columns") or "DATE" not in table.columns:
         return None
     df = table.copy()
     df["DATE"] = pd.to_datetime(df["DATE"])
-    df = df[df["DATE"] <= current_date]
+    elapsed = max((current_date - df["DATE"].min()).total_seconds(), 0.0)
+    df = df[df["DATE"] <= current_date + pd.Timedelta(seconds=0.1 + _SUMMARY_TIME_RTOL * elapsed)]
     if len(df) == 0:
         return None
     return df.sort_values("DATE").iloc[-1].copy()

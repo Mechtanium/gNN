@@ -1,90 +1,116 @@
-"""The gNN app page: the deck and the run settings on the left, the reservoir in
-3-D on the top right, the loss curves below it — the ResInsight layout.
+"""The gNN application: build a reservoir model, hand it to the simulator, and run the work paths
+on it — laid out as a desktop modelling package.
 
-Everything the page shows comes from the messages ``workflow.train`` streams:
-the ``grid`` message gives the 3-D view its cells and fixed colour ranges, each
-``loss`` message extends the curves, each ``state`` snapshot recolours the cells.
-The left pane is the run: what to train and the button that starts it. What is
-*displayed* — property, snapshot, slices, colour map, exaggeration, playback —
-belongs to the 3-D view's own hover panel, so looking around costs no rerun and
-nothing here has to mirror it.
+The toolbar holds the project commands and the five jobs (Check, Simulate, History match,
+Match + forecast, Invert) with the progress of the latest; the sidebar the explorer of the
+model; the tabs the stages of the work — Model, Wells & schedule, Simulation, History match,
+Forecast, Inversion; the status bar what is open. Each tab's content lives in ``ui/``.
+
+Every job receives the whole project as one bundle (``ui/session.py``), so the deck, the
+history | prediction boundary, the field record and the prior always travel together; no job
+takes a setting.
 """
 
 import perdlit as pl
 
-from workflow import train
+import workflow
+from ui import model, results, session, wells
+from ui.common import RETAIN
 
-FIELD_LABELS = {
-    "S_w": "Water saturation (S_w)",
-    "S_o": "Oil saturation (S_o)",
-    "S_g": "Gas saturation (S_g)",
-    "p_o": "Oil pressure (p_o) [psia]",
-    "p_w": "Water pressure (p_w) [psia]",
-    "p_g": "Gas pressure (p_g) [psia]",
-    "R_so": "Dissolved gas ratio (R_so) [Mscf/stb]",
-}
-PRESETS = {"Quick (CPU, deck-sized)": "quick", "Live run (GPU, slow)": "gold"}
+p = session.project()
+name = p.name
+bundle = session.Bundle(p)
+deck = session.deck_name(p)
+boundary = p.history_end_days()
+gen = pl.session_state.get("generation", 0)
 
+# ── toolbar: project commands, the jobs, and how the latest is getting on ──────────────
+with pl.toolbar:
+    template = pl.menu("New", list(session.TEMPLATES), key="new", icon="new",
+                       help="Start a model from a design or from a sample deck")
+    if template:
+        session.replace(session.TEMPLATES[template]())
+        pl.session_state["generation"] = gen + 1
+        pl.set_value("top", "Model")
+        pl.set_value("model_tab", "Project")
+        session.notice(f"New project from {template}")
+        pl.rerun()
+    if pl.action("Open", key="open", icon="open", help="Open a .gnn project, a deck or a zipped deck tree"):
+        pl.set_value("top", "Model")
+        pl.set_value("model_tab", "Project")
+    pl.download("Save", lambda: p.bundle()[0], filename=f"{name}.gnn", mime="application/zip", key="save",
+                icon="save")
+    pl.download("Export", lambda: p.deck_zip(), filename=f"{name}_deck.zip", mime="application/zip",
+                key="export", icon="export")
+    pl.divider()
+    check_run = pl.button("Check", callable=workflow.check, args=[bundle, deck], key="run_check", icon="check",
+                          type="secondary", deadline_s=1800, retain=RETAIN["check"],
+                          help="OPM Flow reads the deck and builds the model, without simulating")
+    sim_run = pl.button("Simulate", callable=workflow.simulate, args=[bundle, deck], key="run_simulate",
+                        icon="play", type="secondary", deadline_s=12 * 3600, retain=RETAIN["simulate"],
+                        help="Hand the model to OPM Flow and show its simulated history")
+    pl.divider()
+    hm_run = pl.button("History match", callable=workflow.history_match, args=[bundle, deck],
+                       key="run_history", icon="chart", deadline_s=72 * 3600, retain=RETAIN["train"],
+                       help="Work path 1: match the whole simulated history")
+    fc_run = pl.button("Match + forecast", callable=workflow.history_forecast, args=[bundle, deck],
+                       key="run_forecast", icon="clock", deadline_s=72 * 3600, retain=RETAIN["train"],
+                       disabled=boundary is None,
+                       help=("Work path 2: match the history to the boundary and forecast past it"
+                             if boundary is not None else "Set the history | prediction boundary first (Schedule)"))
+    inv_run = pl.button("Invert", callable=workflow.invert, args=[bundle, deck], key="run_invert",
+                        icon="target", deadline_s=72 * 3600, retain=RETAIN["invert"], disabled=not p.record,
+                        help=("Work path 3: invert the field record for the uncertain properties"
+                              if p.record else "Enter or import the observed record first (Observed data)"))
+    pl.spacer()
+    runs = {"Check": check_run, "Simulation": sim_run, "History match": hm_run, "Forecast": fc_run,
+            "Inversion": inv_run}
+    started = [(r.started_at or 0.0, label, r) for label, r in runs.items() if not r.id.startswith("idle-")]
+    if started:
+        _, label, latest = max(started, key=lambda s: s[0])
+        pl.progress(latest, field=2, where=(0, "stage"), label="7.message", key="toolbar_progress",
+                    text=None)
 
-# ── Left pane: run settings and the deck ────────────────────────────────
+# ── sidebar: the explorer ──────────────────────────────────────────────────────────────
 with pl.sidebar:
-    pl.header("Deck")
-    deck = pl.file_uploader("Eclipse deck (.DATA, self-contained)", type=["DATA", "data"])
+    pl.header("Explorer")
+    node = pl.tree(model.outline(p, runs), key=f"explorer{gen}", label=name, height=640)
+    if node and node != pl.session_state.get("explorer_seen"):
+        pl.session_state["explorer_seen"] = node
+        for target_key, target in model.navigate(node, p):
+            pl.set_value(target_key, target)
 
-    pl.header("Run")
-    preset_label = pl.radio("Preset", list(PRESETS))
-    preset = PRESETS[preset_label]
-    gold = preset == "gold"
-    n_iter = pl.number_input("Iterations", 1, 200000, 20000 if gold else 200)
-    seed = pl.number_input("Seed", 0, 9999, 30)
-    snapshot_every = pl.number_input("Cell-state snapshot every N iterations", 1, 5000, 50 if gold else 10)
-    n_snapshots = pl.number_input("Report times per snapshot", 1, 32, 8)
-    with pl.expander("Network (0 = the preset's choice)"):
-        m_width = pl.number_input("DGM width", 0, 512, 0)
-        n_blocks = pl.number_input("DGM depth (blocks)", 0, 16, 0)
-        n_eig = pl.number_input("Eigenmodes n_eig", 0, 63, 0)
+# ── status bar ─────────────────────────────────────────────────────────────────────────
+with pl.statusbar:
+    pl.text(f"{name} · {p.kind}")
+    pl.divider()
+    if p.design is not None:
+        g = p.design["grid"]
+        pl.text(f"{g['nx']} × {g['ny']} × {g['nz']} cells · {len(p.design['wells'])} wells · {p.design['units']}")
+    else:
+        pl.text(f"{len(p.deck.files)} file(s) · {sum(1 for _ in p.deck.walk())} keywords")
+    pl.divider()
+    pl.text("history | prediction at day " + (f"{boundary:g}" if boundary is not None else "— not set"))
+    pl.divider()
+    pl.text(f"field record: {len(p.record)} rows" if p.record else "no field record")
+    pl.spacer()
+    pl.write(check_run)
 
-    run = pl.button(
-        "Train",
-        callable=train if deck is not None else None,
-        args=[[deck.read()] if deck is not None else [], deck.name if deck is not None else "deck.DATA", preset, n_iter, seed],
-        kwargs={"m_width": m_width, "n_blocks": n_blocks, "n_eig": n_eig,
-                "log_every": 1, "snapshot_every": snapshot_every, "n_snapshots": n_snapshots},
-        deadline_s=72 * 3600 if gold else 4 * 3600,
-        # Keep several sweeps of snapshots, not just the newest: the 3-D view's
-        # iteration playback walks the frames it still holds.
-        retain={"kind_field": 0, "keep": {"state": n_snapshots * 12, "grid": 64, "stage": 8}},
-        help="Runs OPM Flow, extracts the case through ResInsight, then trains as a job on this "
-             "workstation; a deck must be uploaded first.",
-    )
+# ── the stages of the work ─────────────────────────────────────────────────────────────
+for kind, text in session.take_notices():
+    (pl.caption if kind == "note" else pl.markdown)(text if kind == "note" else f"**{text}**")
 
-# ── Right pane, top: the reservoir ──────────────────────────────────────
-# Its hover panel owns the view: property, snapshot, slicing, colour map,
-# per-axis exaggeration, grid lines, axes and the two playbacks.
-pl.grid3d(
-    run,
-    field="S_w",
-    t_index=max(0, n_snapshots - 1),
-    field_labels=FIELD_LABELS,
-    z_scale=5,
-    height=560,
-    key="reservoir",
-)
-
-# ── Right pane, bottom: the losses ──────────────────────────────────────
-left, right = pl.columns([3, 1])
-with left:
-    pl.subheader("Losses")
-    pl.line_chart(
-        run, x=1, y=[2, 3, 4, 5, 6], where=(0, "loss"), y_scale="log",
-        legend=["total", "pde", "ic", "data", "well"], labels=["iteration", "loss"], height=340,
-    )
-with right:
-    pl.subheader("Run")
-    pl.metric("Stage", run, field="7.stage", where=(0, "stage"))
-    pl.progress(run, field=2, where=(0, "stage"), text="pipeline")
-    pl.metric("Iteration", run, field=1, where=(0, "loss"))
-    pl.metric("Total loss", run, field=2, where=(0, "loss"), fmt=".4f")
-    pl.metric("Well loss", run, field=6, where=(0, "loss"), fmt=".4f")
-    pl.progress(run, total=n_iter, field=1, where=(0, "loss"))
-    pl.write(run)
+model_tab, wells_tab, sim_tab, hm_tab, fc_tab, inv_tab = pl.tabs(
+    ["Model", "Wells & schedule", "Simulation", "History match", "Forecast", "Inversion"], key="top")
+with model_tab:
+    model.render(p, check_run, gen)
+with wells_tab:
+    wells.render(p, gen)
+with sim_tab:
+    results.simulation(p, check_run, sim_run)
+with hm_tab:
+    results.history(p, hm_run)
+with fc_tab:
+    results.forecast(p, fc_run)
+with inv_tab:
+    results.inversion(p, inv_run, gen)

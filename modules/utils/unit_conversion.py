@@ -163,6 +163,11 @@ _BLACKOIL_FACTORS: dict[str, float] = {
     "dens_w": KG_M3_TO_LB_FT3,
     "dens_g": KG_M3_TO_LB_FT3,
     "rsvd_depth": M_TO_FT,
+    # undersaturated live oil (deck_pvto_undersaturated): GOR nodes and the per-pressure slopes
+    # of 1/B_o and 1/(B_o mu_o) (B is a volume ratio and mu in cP in both systems)
+    "pvto_us_rs": RS_METRIC_TO_FIELD,
+    "pvto_us_dinvb": INV_BAR_TO_INV_PSI,
+    "pvto_us_dinvbmu": INV_BAR_TO_INV_PSI,
 }
 
 
@@ -185,6 +190,60 @@ def convert_blackoil_pack(pack: dict[str, np.ndarray], source_units: str) -> dic
     for key, factor in _BLACKOIL_FACTORS.items():
         if key in out and out[key] is not None:
             out[key] = np.asarray(out[key], dtype=float) * factor
+    return out
+
+
+# --- the simulator's well records (ecl_binary.well_records) --------------------------------
+def convert_well_records(rec: dict, source_units: str) -> dict:
+    r"""
+    Return a copy of :func:`modules.utils.ecl_binary.well_records` rescaled to FIELD units: pressures
+    (BHP, limits, connection pressures) bar :math:`\to` psia, depths m :math:`\to` ft, liquid
+    rates and targets sm3 :math:`\to` stb, gas sm3 :math:`\to` Mscf, reservoir volume
+    m3 :math:`\to` rb, and the connection factor (cP·rm3/day/bar) :math:`\to` cP·rb/day/psi.
+    FIELD input is returned unchanged.
+    """
+    if source_units == FIELD:
+        return rec
+    if source_units != METRIC:
+        raise NotImplementedError(f"Unit conversion from {source_units!r} to FIELD is not implemented.")
+    out = dict(rec)
+    phase = np.asarray([M3_TO_BBL, M3_TO_BBL, SM3_GAS_TO_MSCF])
+    out["targets"] = np.asarray(rec["targets"], float) * np.asarray(
+        [M3_TO_BBL, M3_TO_BBL, SM3_GAS_TO_MSCF, M3_TO_BBL, M3_TO_BBL, BAR_TO_PSI, BAR_TO_PSI])
+    out["rates"] = np.asarray(rec["rates"], float) * phase
+    out["conn_rates"] = np.asarray(rec["conn_rates"], float) * phase
+    for key in ("bhp", "conn_p"):
+        out[key] = np.asarray(rec[key], float) * BAR_TO_PSI
+    for key in ("datum", "conn_depth", "conn_diameter"):
+        out[key] = np.asarray(rec[key], float) * M_TO_FT
+    out["conn_cf"] = np.asarray(rec["conn_cf"], float) * (M3_TO_BBL / BAR_TO_PSI)
+    return out
+
+
+# --- analytic aquifers (ReservoirExtractors.deck_fetkovich_aquifers) ------------------------
+def convert_aquifers(aquifers: list[dict], source_units: str) -> list[dict]:
+    r"""
+    Return copies of the deck's Fetkovich aquifers in FIELD units: the datum m :math:`\to` ft,
+    the initial pressure bar :math:`\to` psia, the water volume sm3 :math:`\to` stb, the
+    compressibility 1/bar :math:`\to` 1/psi, the productivity index sm3/d/bar :math:`\to`
+    stb/d/psi and a stated influx coefficient m2 :math:`\to` ft2. FIELD input is returned
+    unchanged.
+    """
+    if source_units == FIELD:
+        return list(aquifers)
+    if source_units != METRIC:
+        raise NotImplementedError(f"Unit conversion from {source_units!r} to FIELD is not implemented.")
+    out = []
+    for aq in aquifers:
+        a = dict(aq)
+        a["datum"] = aq["datum"] * M_TO_FT
+        a["p0"] = None if aq["p0"] is None else aq["p0"] * BAR_TO_PSI
+        a["vw0"] = aq["vw0"] * M3_TO_BBL
+        a["ct"] = aq["ct"] * INV_BAR_TO_INV_PSI
+        a["pi"] = aq["pi"] * M3_TO_BBL / BAR_TO_PSI
+        a["connections"] = [c[:7] + (None if c[7] is None else c[7] * M_TO_FT ** 2,) + c[8:]
+                            for c in aq["connections"]]
+        out.append(a)
     return out
 
 

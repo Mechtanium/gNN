@@ -2,7 +2,7 @@ r"""
 The group-structured training objective and its ENGD residual-row view.
 
 The objective over the active loss groups :math:`g \in \mathcal{G}` (a config-
-dependent subset of pde/ic/data/well/reg/bc) on one frozen supervision window is
+dependent subset of pde/ic/data/well/ctrl/aqu/eq/mb/reg/bc) on one frozen supervision window is
 
 .. math::
 
@@ -15,8 +15,8 @@ dependent subset of pde/ic/data/well/reg/bc) on one frozen supervision window is
     \left(\frac{r_{gk}(\theta)}{s_g}\right)^{2}
 
 where:
-- :math:`r_{gk}`: the :math:`k`-th scalar residual of group :math:`g` (a PDE component, a normalized state misfit, a well-observable misfit, an inversion penalty row, or a boundary flux). Cell-state misfits carry the per-channel mask of :func:`pinnlab.residuals.state_row_mask` (``rs_supervision="oil_only"`` silences :math:`R_{so}` where the reference holds no oil).
-- :math:`s_g`: the group's calibrated scale (:class:`~pinnlab.residuals.Scales`).
+- :math:`r_{gk}`: the :math:`k`-th scalar residual of group :math:`g` (a PDE component, a normalized state misfit, a well-observable misfit, a phase-equilibrium row of :mod:`modules.equilibrium`, a whole-reservoir material-balance row of :func:`modules.residuals.mass_balance_coefficients`, an inversion penalty row, or a boundary flux). Cell-state misfits carry the per-channel mask of :func:`modules.residuals.state_row_mask` (``rs_supervision="oil_only"`` silences :math:`R_{so}` where the reference holds no oil).
+- :math:`s_g`: the group's calibrated scale (:class:`~modules.residuals.Scales`).
 - :math:`w_g`: the group weight (fixed or NTK-adapted).
 - :math:`N_g`: the group's scalar element count on the window.
 
@@ -32,7 +32,7 @@ residual vector — the ENGD weight-consistency contract:
     \nabla_\theta \mathcal{L} \;=\; 2\,\hat J^{\top} \hat r
 
 where:
-- :math:`\hat J = \partial\hat r/\partial\theta`: the row Jacobian assembled by :mod:`pinnlab.engd`.
+- :math:`\hat J = \partial\hat r/\partial\theta`: the row Jacobian assembled by :mod:`modules.engd`.
 
 Both surfaces are built from the same residual evaluations, so the identity
 holds by construction (up to float32 accumulation in the reported components).
@@ -42,9 +42,9 @@ from __future__ import annotations
 
 from typing import Callable, NamedTuple
 
-from .config import RunConfig
+from .config import BackpropDesign, ResidualDesign, RunConfig
 from .casedata import CaseData
-from .residuals import Extras, ResidualOps, Scales, state_row_mask
+from .residuals import Extras, ResidualOps, Scales, state_misfit, state_row_mask
 
 
 class Window(NamedTuple):
@@ -64,6 +64,7 @@ class Window(NamedTuple):
     ci_ic: object
     bc_sel: object
     t_b: object
+    s_p: object = None             # the sample of every PDE slice (a family of reservoirs), else None
 
 
 def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scales,
@@ -71,38 +72,81 @@ def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scale
     """Per-group residual-array builders shared by the loss and the rows view.
 
     Each builder maps ``(params, window) -> scaled residual array`` whose mean
-    square is the group's loss term. The ``well`` group is a deterministic
-    whole-set row block and ignores the window.
+    square is the group's loss term. The ``well``, ``ctrl`` and ``reg`` groups are
+    deterministic whole-set rows and ignore the window; contact inversion swaps
+    the IC target for the parametric capillary-gravity equilibrium.
     """
+    from .encodings import base_cell
     import jax
     import jax.numpy as jnp
     from jax import vmap
 
+    fam = extras.family if extras is not None else None     # a family of reservoirs (modules.family)
     encoder = prim.encoder
     rs_inv = 1.0 / scales.res_scale
     state_scale = scales.state_scale
 
     def _xt_of(ci, t):
-        return jnp.concatenate([centroids[ci], jnp.reshape(t, (1,))])
+        return jnp.concatenate([centroids[base_cell(encoder, ci)], jnp.reshape(t, (1,))])
 
     builders: dict = {}
 
     if "pde" in groups:
-        def pde_arr(params, win: Window):
-            _slice = jax.checkpoint(lambda ts: ops.pde_spectral(params, ts, None) * rs_inv)
-            return jax.lax.map(_slice, win.t_p)                          # (S, n_eig, 3)
+        if (cfg.residual_design is ResidualDesign.CARTESIAN_PDE
+                and cfg.backprop_design is BackpropDesign.CHAIN_RULE):
+            def pde_arr(params, win: Window):
+                enc_args = encoder.gather_args(win.ci_p)
+                Rp = vmap(lambda c, t, *a: ops.pde_point(params, _xt_of(c, t), *a))(
+                    win.ci_p, win.t_p, *enc_args)
+                return Rp * rs_inv
+        elif cfg.residual_design is ResidualDesign.SPECTRAL_PDE:
+            needs_cells = cfg.backprop_design is BackpropDesign.CHAIN_RULE
+
+            def pde_arr(params, win: Window):
+                cells = win.ci_p if needs_cells else None
+                if fam is not None and win.s_p is not None:               # a family: each slice its sample
+                    def _slice_s(ts_s):
+                        ts, s = ts_s
+                        return ops.pde_spectral(params, ts, cells, forcing_override=fam.forcing(s),
+                                                k_override=fam.k_override(s), m=fam.m(s)) * rs_inv
+                    return jax.lax.map(jax.checkpoint(_slice_s), (win.t_p, win.s_p))
+                _slice = jax.checkpoint(lambda ts: ops.pde_spectral(params, ts, cells) * rs_inv)
+                return jax.lax.map(_slice, win.t_p)                      # (S, n_eig, 3)
+        elif cfg.residual_design is ResidualDesign.HYBRID_PDE:
+            bal_p, bal_s = ops.pde_hybrid.balance
+            s_p, s_s = rs_inv[0], rs_inv[1:]
+
+            def pde_arr(params, win: Window):
+                # block-balanced: the mean over the concatenation equals
+                # (mean_p + mean_s) / 2, so neither block is swamped by the other's count
+                def _slice(ts):
+                    r_p, r_s = ops.pde_hybrid(params, ts)
+                    return jnp.concatenate([jnp.reshape(r_p * s_p * bal_p, (-1,)),
+                                            jnp.reshape(r_s * s_s * bal_s, (-1,))])
+                return jax.lax.map(jax.checkpoint(_slice), win.t_p)     # (S, n_eig + 2n)
+        else:  # cartesian_pde + fem_nodal
+            def pde_arr(params, win: Window):
+                if fam is not None and win.s_p is not None:               # a family: each slice its sample
+                    def _slice_s(ts_s):
+                        ts, s = ts_s
+                        return ops.pde_fem(params, ts, forcing_override=fam.forcing(s),
+                                           k_override=fam.k_override(s), m=fam.m(s)) * rs_inv
+                    return jax.lax.map(jax.checkpoint(_slice_s), (win.t_p, win.s_p))
+                _slice = jax.checkpoint(lambda ts: ops.pde_fem(params, ts) * rs_inv)
+                return jax.lax.map(_slice, win.t_p)                      # (S, n, 3)
         builders["pde"] = pde_arr
 
     point_builders: dict = {}      # g -> (point_fn(params, win, i) -> (4,), n_points(win))
 
     if "ic" in groups:
         y_ic = case.y_ic
+        equil = extras.invm.equil_ic if (extras is not None and extras.invm is not None) else None
 
         def ic_arr(params, win: Window):
             enc_args = encoder.gather_args(win.ci_ic)
             Sic = vmap(lambda c, *a: prim.primaries_point(params, _xt_of(c, case.t_ic), *a))(
                 win.ci_ic, *enc_args)
-            target = y_ic[win.ci_ic]
+            target = equil(params, win.ci_ic) if equil is not None else y_ic[win.ci_ic]
             return (Sic - target) / state_scale * state_row_mask(cfg, y_ic[win.ci_ic])
         builders["ic"] = ic_arr
 
@@ -110,7 +154,7 @@ def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scale
             c = win.ci_ic[i]
             enc_args = encoder.gather_args(c)
             Sic = prim.primaries_point(params, _xt_of(c, case.t_ic), *enc_args)
-            target = y_ic[c]
+            target = equil(params, c[None])[0] if equil is not None else y_ic[c]
             return (Sic - target) / state_scale * state_row_mask(cfg, y_ic[c])
         point_builders["ic"] = (ic_point, lambda win: win.ci_ic.shape[0])
 
@@ -119,18 +163,92 @@ def _term_builders(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: Scale
             enc_args = encoder.gather_args(win.ci_d)
             Sd = vmap(lambda c, t, *a: prim.primaries_point(params, _xt_of(c, t), *a))(
                 win.ci_d, win.t_d, *enc_args)
-            return (Sd - win.y_d) / state_scale * state_row_mask(cfg, win.y_d)
+            return state_misfit(cfg, Sd, win.y_d, state_scale)
         builders["data"] = data_arr
 
         def data_point(params, win: Window, i):
             c = win.ci_d[i]
             enc_args = encoder.gather_args(c)
             Sd = prim.primaries_point(params, _xt_of(c, win.t_d[i]), *enc_args)
-            return (Sd - win.y_d[i]) / state_scale * state_row_mask(cfg, win.y_d[i])
+            return state_misfit(cfg, Sd, win.y_d[i], state_scale)
         point_builders["data"] = (data_point, lambda win: win.ci_d.shape[0])
 
     if "well" in groups:
         builders["well"] = lambda params, win: ops.well_arr(params)
+
+    if "ctrl" in groups:
+        builders["ctrl"] = lambda params, win: ops.ctrl_arr(params)
+
+    if "aqu" in groups:
+        builders["aqu"] = lambda params, win: ops.aqu_arr(params)
+
+    if "eq" in groups:
+        from .equilibrium import equilibrium_row, gas_redissolves, point_layout, saturated_table
+        from .sampling import _slice_mode
+
+        pb, rs_tab = saturated_table(case.tables)
+        rs_max, t_scale = float(case.phys.RS_MAX), float(case.t_end)
+        redissolves = gas_redissolves(cfg)
+        slice_mode = _slice_mode(cfg)
+
+        def _eq_cells(win: Window):
+            stride, n_c = point_layout(win.ci_ic.shape[0], win.t_p.shape[0], cfg.full_batch_cap)
+            return win.ci_ic[::stride], n_c
+
+        def n_eq(win: Window) -> int:
+            return _eq_cells(win)[1] * win.t_p.shape[0] if slice_mode else win.ci_p.shape[0]
+
+        def eq_point(params, win: Window, i):
+            if slice_mode:
+                cells, n_c = _eq_cells(win)
+                c, t = cells[i % n_c], win.t_p[i // n_c]
+            else:
+                c, t = win.ci_p[i], win.t_p[i]
+            enc_args = encoder.gather_args(c)
+
+            def prims(tt):
+                return prim.primaries_point(params, _xt_of(c, tt), *enc_args)
+
+            if redissolves:
+                y = prims(t)
+                drs = jnp.zeros((), y.dtype)
+            else:
+                y, dy = jax.jvp(prims, (t,), (jnp.ones_like(t),))
+                drs = dy[3]
+            r = equilibrium_row(y[0], y[2], y[3], drs, pb, rs_tab, rs_max, t_scale, redissolves)
+            return jnp.reshape(r, (1,))
+
+        def eq_arr(params, win: Window):
+            return vmap(lambda i: eq_point(params, win, i))(jnp.arange(n_eq(win)))
+
+        builders["eq"] = eq_arr
+        point_builders["eq"] = (eq_point, n_eq)
+
+    if "mb" in groups:
+        mb_coef = scales.mb_coef
+
+        def mb_arr(params, win: Window):
+            def _slice(ts):
+                net = ops.mass_balance(params, ts)[0]
+                return net * jnp.asarray(mb_coef, net.dtype)
+            return jax.lax.map(jax.checkpoint(_slice), win.t_p)          # (S, 3)
+        builders["mb"] = mb_arr
+
+    if "reg" in groups:
+        builders["reg"] = lambda params, win: ops.reg_arr(params)
+
+    if "bc" in groups:
+        bc_inv = 1.0 / scales.bc_scale
+        bc_cell, bc_axis = case.bc_cell, case.bc_axis
+
+        def bc_arr(params, win: Window):
+            cells = bc_cell[win.bc_sel]
+            axes = bc_axis[win.bc_sel]
+            enc_args = encoder.gather_args(cells)
+            Fb = vmap(lambda c, a, *ea: ops.flux_point(params, _xt_of(c, win.t_b), *ea)[:, a])(
+                cells, axes, *enc_args)
+            return Fb * bc_inv
+        builders["bc"] = bc_arr
 
     builders["_point"] = point_builders
     return builders
@@ -166,7 +284,7 @@ def make_residual_rows(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: S
     The returned callable also carries ``rows.group_rows``: the per-group slices
     of the same vector as ``((name, rows_g, point_g), ...)`` in ``groups`` order,
     with ``concatenate([rows_g(...) for each]) == rows(...)`` exactly. The ENGD
-    assembly (:func:`pinnlab.engd.gramian_grouped`) uses them to sweep each group
+    assembly (:func:`modules.engd.gramian_grouped`) uses them to sweep each group
     in its own cheaper AD direction: a handful of projected PDE rows costs a few
     vjp sweeps, while the tens of thousands of cell-state rows cost :math:`P` jvp
     columns — neither would be affordable in the other's direction.
@@ -177,7 +295,7 @@ def make_residual_rows(cfg: RunConfig, groups, ops: ResidualOps, prim, scales: S
     corresponding slice of ``rows_g``) and ``n_points(win)`` the point count. The
     Jacobian of such a group is a stack of independent :math:`4 \times P`
     per-point blocks, which reverse mode assembles at four vjp sweeps of a
-    *single-point* graph each (:func:`pinnlab.engd.gramian_pointwise`) — a cost
+    *single-point* graph each (:func:`modules.engd.gramian_pointwise`) — a cost
     independent of :math:`P`, against :math:`P` whole-batch jvp columns.
     """
     import jax.numpy as jnp

@@ -21,7 +21,7 @@ where:
 - :math:`n_c`: the number of active cells.
 - :math:`u^{\mathrm{ref}}_c(t_i)`: the simulator's value in cell :math:`c` at report step :math:`i`.
 
-(Lifted unchanged from PINN-Lab's ``diagnostics`` module; the figure code stayed behind.)
+(Lifted unchanged from PINN-Lab's ``diagnostics`` module, with the cell volumes of its ``inversion`` module; the figure code stayed behind.)
 """
 
 from __future__ import annotations
@@ -70,3 +70,50 @@ def rmse_series(bundle, params, max_times: int = 16, field: str = "p_o"):
     idx = onp.unique(onp.linspace(0, n_t - 1, min(max_times, n_t)).round().astype(int))
     vals = onp.array([field_rmse(bundle, params, field, int(i)) for i in idx])
     return idx, vals
+
+
+def supersaturated_share(bundle, params, max_times: int = 16, tol: float = 0.05) -> float:
+    r"""
+    The share of (cell, report time) pairs, on :func:`rmse_series`'s strided report times,
+    whose predicted oil is supersaturated, :math:`R_s > (1 + \mathrm{tol})\,R_s^{\mathrm{sat}}(p_o)`
+    (:func:`modules.equilibrium.supersaturated_fraction`) — zero for any state the
+    simulator produces.
+    """
+    import numpy as onp
+
+    from .equilibrium import saturated_table, supersaturated_fraction
+
+    pb, rs_tab = saturated_table(bundle.case.tables)
+    n_t = bundle.case.n_times
+    idx = onp.unique(onp.linspace(0, n_t - 1, min(max_times, n_t)).round().astype(int))
+    pred = onp.stack([onp.asarray(predict_cells(bundle, params, float(bundle.case.times[i])))
+                      for i in idx])
+    return supersaturated_fraction(pred[..., 0], pred[..., 3], pb, rs_tab, tol)
+
+
+def mean_rmse(bundle, params) -> float:
+    r"""
+    The time-mean pressure RMSE over **all** report times of the case,
+
+    .. math::
+
+        \overline{\mathrm{RMSE}}
+        \;=\;
+        \frac{1}{n_t}\sum_{i=1}^{n_t} \mathrm{RMSE}(t_i)
+
+    where:
+
+    - :math:`\mathrm{RMSE}(t_i)`: the single-report-time pressure RMSE of :func:`pressure_rmse`.
+    - :math:`n_t`: the case's report-time count (``case.n_times``) — every report step enters, unlike :func:`rmse_series`'s strided subset.
+    """
+    return float(sum(pressure_rmse(bundle, params, int(i))
+                     for i in range(bundle.case.n_times)) / bundle.case.n_times)
+
+
+def cell_volumes_ft3(case, spec):
+    """Per-cell volumes [ft³]: exact hex quadrature when FEM static exists, else box product."""
+    import numpy as onp
+
+    if spec is not None:
+        return onp.asarray(spec.static["JxW"]).sum(axis=1)
+    return onp.prod(onp.asarray(case.cell_len, onp.float64), axis=1)

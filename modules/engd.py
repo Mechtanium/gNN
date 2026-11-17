@@ -16,7 +16,7 @@ geometric grid line search:
 where:
 
 - :math:`\hat r(\theta) \in \mathbb{R}^{N}`: the weighted residual rows from
-  :func:`pinnlab.loss.make_residual_rows`, built so that
+  :func:`modules.loss.make_residual_rows`, built so that
   :math:`\mathcal{L} = \Vert \hat r \Vert^2` exactly — group weights and
   scales enter the metric and the gradient consistently by construction.
 - :math:`\hat J = \partial \hat r / \partial \theta \in \mathbb{R}^{N \times P}`:
@@ -34,7 +34,7 @@ where:
   a prepended zero step so a fully stalled update can never ascend).
 
 Two solve regimes, auto-selected at ``resolve()`` time by
-:func:`pinnlab.memplan.engd_plan` — the feasible one with the smaller solve
+:func:`modules.memplan.engd_plan` — the feasible one with the smaller solve
 system (dense iff :math:`P \le N`):
 
 - **dense** (:math:`8P^2 \le` ``jac_budget_bytes``): build the Gramian
@@ -50,7 +50,7 @@ system (dense iff :math:`P \le N`):
   = \hat J^\top (\hat J \hat J^\top + \varepsilon I)^{-1}`.
 
 Either regime assembles :math:`\hat J` in whichever AD direction needs fewer
-sweeps of the residual graph (also fixed by :func:`pinnlab.memplan.engd_plan`):
+sweeps of the residual graph (also fixed by :func:`modules.memplan.engd_plan`):
 
 - **reverse** (``rev``): one vjp sweep per residual row,
   :math:`e_i^\top \hat J = \hat J_{i,:}` — :math:`N` sweeps.
@@ -63,7 +63,7 @@ sweeps of the residual graph (also fixed by :func:`pinnlab.memplan.engd_plan`):
 
 The direction is chosen **per loss group** whenever the row function exposes
 its group slices (``rows_fn.group_rows``, see
-:func:`pinnlab.loss.make_residual_rows`): :func:`gramian_grouped` /
+:func:`modules.loss.make_residual_rows`): :func:`gramian_grouped` /
 :func:`assemble_jacobian_grouped` sweep each group's own residual graph in its
 own cheaper direction and sum the contributions,
 :math:`G = \sum_g \hat J_g^\top \hat J_g`. The projected PDE group — a few dozen
@@ -80,15 +80,15 @@ simply feed the next call a new frozen window, so :math:`\hat J`,
 points.
 
 Two variants repurpose that ``opt_state`` slot for cross-iteration state, both
-wired by a :mod:`pinnlab.pipeline` wrapper rather than a ``RunConfig`` switch:
+wired by a :mod:`modules.pipeline` wrapper rather than a ``RunConfig`` switch:
 
-- :func:`make_spring_step` (:class:`SpringConfig`, :func:`pinnlab.pipeline.with_spring`)
+- :func:`make_spring_step` (:class:`SpringConfig`, :func:`modules.pipeline.with_spring`)
   — SPRING momentum, which shifts the solve's regularizer toward the previous
   direction, :math:`\lambda\Vert\phi - \mu\phi^{k-1}\Vert^2`, so the update
   aggregates curvature across iterations instead of re-deriving it from scratch.
   Free relative to assembly: one extra :math:`P\times P` matvec, no extra AD sweeps.
 - :func:`make_masked_engd_step` (:class:`MaskConfig`,
-  :func:`pinnlab.pipeline.with_masked_engd`) — the adaptive top-:math:`k`
+  :func:`modules.pipeline.with_masked_engd`) — the adaptive top-:math:`k`
   residual-update mask.
 
 :func:`effective_dim` reports :math:`d_{\mathrm{eff}} = \operatorname{tr}(G(G +
@@ -101,6 +101,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Literal, NamedTuple
+
+import numpy as onp
 
 from .config import EngdSettings, Resolved, RunConfig
 
@@ -133,7 +135,7 @@ class MaskState(NamedTuple):
 
     The plain ENGD step is stateless and threads ``opt_state = ()`` through
     untouched; the masked variant repurposes that slot for the EMA score
-    accumulator and the held mask, so :func:`pinnlab.training.train` needs no
+    accumulator and the held mask, so :func:`modules.training.train` needs no
     loop changes.
     """
 
@@ -381,11 +383,13 @@ def assemble_jacobian(r_of: Callable, theta, row_chunk: int = 64,
 
 
 def gramian_streamed(r_of: Callable, theta, row_chunk: int = 64,
-                     direction: str = "auto"):
+                     direction: str = "auto", init=None):
     r"""
     The energy Gramian :math:`G = \hat J^\top \hat J` and gradient
     :math:`\nabla_\theta \mathcal{L} = 2 \hat J^\top r_0`, assembled in the
-    cheaper AD direction. Returns ``(r0, G, grad)``.
+    cheaper AD direction. Returns ``(r0, G, grad)``; with ``init = (G_0, g_0)`` the
+    contributions are accumulated onto that running pair instead of onto zeros (the
+    grouped assembly threads one accumulator through every group).
 
     ``rev`` scans identity chunks :math:`E_c \in \mathbb{R}^{c \times N}`
     synthesized on the fly from their row indices (out-of-range indices in the
@@ -401,7 +405,7 @@ def gramian_streamed(r_of: Callable, theta, row_chunk: int = 64,
     :math:`G = \hat J^\top \hat J`, :math:`\nabla = 2 \hat J^\top r_0` —
     :math:`N/P` times fewer residual-graph sweeps, at
     :math:`\mathcal{O}(N P)` transient storage
-    (:func:`pinnlab.memplan.engd_plan` only selects ``fwd`` when that fits
+    (:func:`modules.memplan.engd_plan` only selects ``fwd`` when that fits
     ``jac_budget_bytes``).
     """
     import jax
@@ -409,7 +413,9 @@ def gramian_streamed(r_of: Callable, theta, row_chunk: int = 64,
 
     if _use_fwd(r_of, theta, direction):
         r0, Jt = _jacobian_fwd(r_of, theta, row_chunk)
-        return r0, Jt @ Jt.T, 2.0 * (Jt @ r0)
+        if init is None:
+            return r0, Jt @ Jt.T, 2.0 * (Jt @ r0)
+        return r0, init[0] + Jt @ Jt.T, init[1] + 2.0 * (Jt @ r0)
 
     r0, vt = _linearize(r_of, theta)
     n = r0.shape[0]
@@ -422,9 +428,10 @@ def gramian_streamed(r_of: Callable, theta, row_chunk: int = 64,
         J_c = jax.vmap(vt)(E_c)
         return G + J_c.T @ J_c, None
 
-    G, _ = jax.lax.scan(body, jnp.zeros((p, p), r0.dtype), jnp.arange(n_chunks))
+    G0 = jnp.zeros((p, p), r0.dtype) if init is None else init[0]
+    G, _ = jax.lax.scan(body, G0, jnp.arange(n_chunks))
     grad = vt(2.0 * r0)
-    return r0, G, grad
+    return r0, G, (grad if init is None else init[1] + grad)
 
 
 def _group_direction(r_of: Callable, theta, jac_budget_bytes: int) -> str:
@@ -436,7 +443,8 @@ def _group_direction(r_of: Callable, theta, jac_budget_bytes: int) -> str:
     return "fwd" if (p < n_g and n_g * p * 8 <= jac_budget_bytes) else "rev"
 
 
-def gramian_pointwise(point_fn, n_points: int, theta, point_chunk: int = 2048):
+def gramian_pointwise(point_fn, n_points: int, theta, point_chunk: int = 2048, init=None,
+                      budget_bytes: int = 4 << 30):
     r"""
     The Gramian and gradient of a point-wise group — ``point_fn(theta, i)`` returns the
     :math:`m` weighted rows of supervision point :math:`i` — assembled from per-point
@@ -457,18 +465,22 @@ def gramian_pointwise(point_fn, n_points: int, theta, point_chunk: int = 2048):
 
     - :math:`J_i`: the point's block, :math:`m` vjp sweeps of the *single-point* graph (``jax.jacrev``, batched over a chunk of points by ``vmap``) — the cost of one point's network evaluation times :math:`3m`, independent of :math:`P`; the whole-batch alternative sweeps :math:`P` jvp columns through all :math:`N_{\mathrm{pts}}` points.
     - :math:`m`: rows per point (the four primaries of a cell-state or IC row); :math:`N_{\mathrm{pts}}`: the group's points on the window.
-    - ``point_chunk``: points per ``lax.scan`` step, bounding the transient block stack at :math:`8\,m\,P\,\mathrm{chunk}` bytes; each chunk's :math:`G` contribution is one GEMM. The last chunk is zero-padded (masked rows contribute nothing).
+    - ``point_chunk``: points per ``lax.scan`` step, bounding the transient block stack at :math:`8\,m\,P\,\mathrm{chunk}` bytes times a compiler-dependent factor; each chunk's :math:`G` contribution is one GEMM. The last chunk is zero-padded (masked rows contribute nothing). ``0`` sizes it from ``budget_bytes`` for the backend in use (:func:`modules.memplan.point_chunk_for`).
+    - ``init``: an optional running ``(G_0, g_0)`` the contributions are accumulated onto, as in :func:`gramian_streamed`.
 
     Returns ``(r0, G, grad)`` with ``r0`` the group's rows in point order.
     """
     import jax
     import jax.numpy as jnp
 
+    from .memplan import point_chunk_for
+
     p = theta.shape[0]
+    m = jax.eval_shape(lambda th: point_fn(th, jnp.int32(0)), theta).shape[0]
+    point_chunk = point_chunk_for(point_chunk, budget_bytes, m, p, jax.default_backend())
     chunk = max(1, min(point_chunk, n_points))
     n_chunks = -(-n_points // chunk)
     pad = n_chunks * chunk - n_points
-    m = jax.eval_shape(lambda th: point_fn(th, jnp.int32(0)), theta).shape[0]
 
     def point_rows_and_jac(i):
         i_safe = jnp.minimum(i, n_points - 1)
@@ -490,14 +502,15 @@ def gramian_pointwise(point_fn, n_points: int, theta, point_chunk: int = 2048):
         grad = grad + 2.0 * (J_flat.T @ r_flat)
         return (G, grad), r_flat
 
-    init = (jnp.zeros((p, p), theta.dtype), jnp.zeros((p,), theta.dtype))
-    (G, grad), r_chunks = jax.lax.scan(body, init, jnp.arange(n_chunks))
+    if init is None:
+        init = (jnp.zeros((p, p), theta.dtype), jnp.zeros((p,), theta.dtype))
+    (G, grad), r_chunks = jax.lax.scan(body, tuple(init), jnp.arange(n_chunks))
     r0 = jnp.reshape(r_chunks, (-1,))[: n_points * m]
     return r0, G, grad
 
 
 def gramian_grouped(group_row_fns, theta, row_chunk: int = 64,
-                    jac_budget_bytes: int = 4 << 30, point_chunk: int = 2048):
+                    jac_budget_bytes: int = 4 << 30, point_chunk: int = 0):
     r"""
     The Gramian and gradient of the full row vector, assembled group by group with
     each group swept in its own cheaper AD direction.
@@ -524,32 +537,45 @@ def gramian_grouped(group_row_fns, theta, row_chunk: int = 64,
 
     where:
 
-    - :math:`\hat J_g = \partial \hat r_g / \partial \theta`: the row Jacobian of group :math:`g` (:func:`pinnlab.loss.make_residual_rows` exposes the per-group slices as ``rows.group_rows``).
+    - :math:`\hat J_g = \partial \hat r_g / \partial \theta`: the row Jacobian of group :math:`g` (:func:`modules.loss.make_residual_rows` exposes the per-group slices as ``rows.group_rows``).
     - :math:`N_g`: the group's row count on the window; :math:`P` the parameter count; :math:`S` the collocation slices; :math:`n_\lambda` the retained modes.
-    - the per-group direction: ``fwd`` iff :math:`P < N_g` and the materialized :math:`\hat J_g` (:math:`8 N_g P` bytes) fits ``jac_budget_bytes``, else ``rev`` — the rule of :func:`pinnlab.memplan.engd_plan` applied per group.
+    - the per-group direction: ``fwd`` iff :math:`P < N_g` and the materialized :math:`\hat J_g` (:math:`8 N_g P` bytes) fits ``jac_budget_bytes``, else ``rev`` — the rule of :func:`modules.memplan.engd_plan` applied per group.
 
     Point-wise groups (``ic``, ``data``: an entry given as ``(row_fn, point_fn,
     n_points)``) take the per-point reverse-mode route of :func:`gramian_pointwise`
     instead of either whole-batch direction.
 
+    The groups are swept one at a time onto **one** running accumulator
+    :math:`(G, \nabla_\theta\mathcal L)`: each group's sweep starts behind an
+    optimization barrier on the running pair, so its residual tape and seed blocks are
+    never live beside another group's, and the :math:`8P^2`-byte Gramian exists once
+    rather than once per group. Left to itself the compiler schedules the independent
+    group sweeps side by side — on NORNE at :math:`P = 15{,}164` that held four
+    :math:`1.7` GiB Gramians and every group's transients at once (7.5 GiB of
+    temporaries for the assembly alone).
+
     Returns ``(r0, G, grad)`` with ``r0`` the concatenated rows in group order —
     identical to :func:`gramian_streamed` on the concatenated row function, up to
     float64 reassociation of the group sums.
     """
+    import jax
     import jax.numpy as jnp
 
-    r_parts, G, grad = [], None, None
+    p = theta.shape[0]
+    G = jnp.zeros((p, p), theta.dtype)
+    grad = jnp.zeros((p,), theta.dtype)
+    r_parts = []
     for entry in group_row_fns:
+        th, G, grad = jax.lax.optimization_barrier((theta, G, grad))
         if isinstance(entry, tuple):
             r_of, point_fn, n_points = entry
-            r0_g, G_g, grad_g = gramian_pointwise(point_fn, n_points, theta, point_chunk)
+            r0_g, G, grad = gramian_pointwise(point_fn, n_points, th, point_chunk,
+                                              init=(G, grad), budget_bytes=jac_budget_bytes)
         else:
             r_of = entry
-            direction = _group_direction(r_of, theta, jac_budget_bytes)
-            r0_g, G_g, grad_g = gramian_streamed(r_of, theta, row_chunk, direction)
+            direction = _group_direction(r_of, th, jac_budget_bytes)
+            r0_g, G, grad = gramian_streamed(r_of, th, row_chunk, direction, init=(G, grad))
         r_parts.append(r0_g)
-        G = G_g if G is None else G + G_g
-        grad = grad_g if grad is None else grad + grad_g
     return jnp.concatenate(r_parts), G, grad
 
 
@@ -598,7 +624,7 @@ def _assemble_dense(r_of, group_fns, theta, s: EngdSettings, direction: str):
     """``(r0, G, grad)`` — grouped when per-group rows exist, single-direction otherwise."""
     if group_fns is None:
         return gramian_streamed(r_of, theta, s.row_chunk, direction)
-    return gramian_grouped(group_fns, theta, s.row_chunk, s.jac_budget_bytes)
+    return gramian_grouped(group_fns, theta, s.row_chunk, s.jac_budget_bytes, s.point_chunk)
 
 
 def _assemble_rows(r_of, group_fns, theta, s: EngdSettings, direction: str):
@@ -610,6 +636,30 @@ def _assemble_rows(r_of, group_fns, theta, s: EngdSettings, direction: str):
 
 def _damping(trace, dim, s: EngdSettings):
     return s.damping_rel * trace / dim + s.damping_abs
+
+
+def _phys_damping(curv, phys, eps_iso, s: EngdSettings):
+    r"""
+    The per-parameter damping of ``damping_mode="marquardt_phys"``,
+
+    .. math::
+
+        e_i \;=\;
+        \begin{cases}
+        \varepsilon & i \text{ a network parameter} \\
+        \max\bigl(\varepsilon_{\mathrm{rel}}\,G_{ii} + \varepsilon_{\mathrm{abs}},\; 10^{-6}\,\varepsilon\bigr) & i \text{ a physical parameter}
+        \end{cases}
+
+    where :math:`\varepsilon` is the isotropic damping of the regime (:func:`_damping`) and
+    :math:`G_{ii}` the Gauss–Newton curvature of parameter :math:`i`. The physical
+    parameters are few, scaled unlike the weights and often weakly determined; damping each
+    in proportion to its own curvature lets it move at the pace its data allow instead of
+    at the pace the network's curvature sets, and the floor keeps a parameter no row
+    reaches from dividing by zero.
+    """
+    import jax.numpy as jnp
+
+    return jnp.where(phys, jnp.maximum(s.damping_rel * curv + s.damping_abs, 1e-6 * eps_iso), eps_iso)
 
 
 def _jacobi(M):
@@ -687,10 +737,12 @@ def _cho_solve_escalated(A, rhs, eps):
     import jax.numpy as jnp
     import jax.scipy.linalg as jsl
 
-    eye = jnp.eye(A.shape[0], dtype=A.dtype)
+    # damping on the diagonal alone: A + e*I with a materialized identity costs one more
+    # dim x dim buffer (a third of the solve's temporaries at P = 15k)
+    diag = jnp.arange(A.shape[0])
 
     def _solve(e):
-        return jsl.cho_solve(jsl.cho_factor(A + e * eye), rhs)
+        return jsl.cho_solve(jsl.cho_factor(A.at[diag, diag].add(e)), rhs)
 
     def _rung(carry, _):
         x, e, ok = carry
@@ -704,7 +756,7 @@ def _cho_solve_escalated(A, rhs, eps):
     return x, eps_used
 
 
-def solve_dense(G, grad, s: EngdSettings):
+def solve_dense(G, grad, s: EngdSettings, phys=None):
     r"""
     The :math:`P \times P` solve :math:`(G + \varepsilon I)\psi = \nabla\mathcal{L}`.
 
@@ -735,6 +787,12 @@ def solve_dense(G, grad, s: EngdSettings):
     since :math:`\operatorname{tr}\tilde G / P = 1` makes
     :math:`\varepsilon = \varepsilon_{\mathrm{rel}} + \varepsilon_{\mathrm{abs}}` exactly.
 
+    Under ``damping_mode="marquardt_phys"`` (with the boolean mask ``phys`` of the
+    physical parameters) the damping is the diagonal :math:`E` of :func:`_phys_damping` —
+    isotropic on the network, curvature-proportional on the physical block — solved the
+    same way, :math:`(E^{-1/2} G E^{-1/2} + I)\,y = E^{-1/2}\nabla\mathcal{L}`,
+    :math:`\psi = E^{-1/2} y`.
+
     Returns ``(psi, eps, M)`` where ``M`` is the matrix the damping was applied to
     (:math:`G` or :math:`\tilde G`), for :func:`effective_dim` to report against.
     """
@@ -745,6 +803,12 @@ def solve_dense(G, grad, s: EngdSettings):
     if s.solver == "lstsq":
         psi = jnp.linalg.lstsq(G, grad, rcond=s.rcond)[0]
         return psi, jnp.zeros((), G.dtype), G
+    if s.damping_mode == "marquardt_phys" and phys is not None:
+        eps_iso = _damping(jnp.trace(G), p, s)
+        inv_sqrt_e = 1.0 / jnp.sqrt(_phys_damping(jnp.diag(G), phys, eps_iso, s))
+        G_t = G * inv_sqrt_e[:, None] * inv_sqrt_e[None, :]
+        y, eps = _cho_solve_escalated(G_t, grad * inv_sqrt_e, jnp.ones((), G.dtype))
+        return y * inv_sqrt_e, eps, G_t
     if s.damping_mode == "marquardt":
         G_t, inv_sqrt_d = _jacobi(G)
         eps = _damping(jnp.trace(G_t), p, s)          # == damping_rel + damping_abs
@@ -755,7 +819,7 @@ def solve_dense(G, grad, s: EngdSettings):
     return psi, eps, G
 
 
-def solve_rowspace(J, r0, s: EngdSettings, row_shift=None):
+def solve_rowspace(J, r0, s: EngdSettings, row_shift=None, phys=None):
     r"""
     The :math:`N \times N` rowspace solve.
 
@@ -774,7 +838,9 @@ def solve_rowspace(J, r0, s: EngdSettings, row_shift=None):
       subtracted from the right-hand side (``None`` :math:`\Rightarrow c = 0`).
 
     By the push-through identity this equals the damped dense direction with
-    the same :math:`\varepsilon`. Under ``damping_mode="marquardt"`` the row Gram is
+    the same :math:`\varepsilon`; under ``damping_mode="marquardt_phys"`` the same identity
+    with the diagonal damping :math:`E` of :func:`_phys_damping` gives
+    :math:`\psi = E^{-1}\hat J^\top(\hat J E^{-1} \hat J^\top + I)^{-1}(2\hat r - c)`. Under ``damping_mode="marquardt"`` the row Gram is
     Jacobi-equilibrated exactly as in :func:`solve_dense`, damping
     :math:`\hat J\hat J^\top + \varepsilon\operatorname{diag}(\hat J \hat J^\top)`
     — note this is the *row*-scale analogue (rows equilibrated by
@@ -818,6 +884,14 @@ def solve_rowspace(J, r0, s: EngdSettings, row_shift=None):
     if s.solver == "lstsq":
         alpha = jnp.linalg.lstsq(A, rhs, rcond=s.rcond)[0]
         return J.T @ alpha, jnp.zeros((), J.dtype), grad, A
+    if s.damping_mode == "marquardt_phys" and phys is not None:
+        # (J^T J + E) psi = J^T rhs  <=>  psi = E^-1 J^T (J E^-1 J^T + I)^-1 rhs
+        eps_iso = _damping(jnp.trace(A), n, s)
+        inv_sqrt_e = 1.0 / jnp.sqrt(_phys_damping(jnp.sum(J * J, axis=0), phys, eps_iso, s))
+        J_s = J * inv_sqrt_e[None, :]
+        A_t = J_s @ J_s.T
+        y, eps = _cho_solve_escalated(A_t, rhs, jnp.ones((), J.dtype))
+        return (J_s.T @ y) * inv_sqrt_e, eps, grad, A_t
     if s.damping_mode == "marquardt":
         A_t, inv_sqrt_d = _jacobi(A)
         eps = _damping(jnp.trace(A_t), n, s)          # == damping_rel + damping_abs
@@ -852,9 +926,23 @@ def grid_line_search(objective: Callable, theta, psi, s: EngdSettings):
     return theta - eta * psi, eta, losses[i]
 
 
+def phys_mask(params0):
+    """Boolean mask over the flattened parameter vector selecting the ``params["phys"]``
+    leaves (all ``False`` when there are none)."""
+    import jax
+
+    from .models import flatten_state
+
+    mask = jax.tree.map(lambda x: onp.zeros(onp.shape(x), onp.float32), params0)
+    if isinstance(mask, dict) and "phys" in mask:
+        mask["phys"] = jax.tree.map(lambda x: onp.ones(onp.shape(x), onp.float32), mask["phys"])
+    flat, _ = flatten_state(mask)
+    return onp.asarray(flat) > 0.5
+
+
 def make_engd_step(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
-                   rows_fn: Callable, model_bundle, env) -> Callable:
-    """
+                   rows_fn: Callable, model_bundle, env, freeze_phys: bool = False) -> Callable:
+    r"""
     The jitted stateless ENGD step:
     ``step(params, opt_state, w, win) -> (params', opt_state, loss, EngdAux)``.
 
@@ -862,6 +950,241 @@ def make_engd_step(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
     solve, and unflattened back; ``opt_state`` passes through untouched. The
     solve regime and assembly direction are fixed at build time from
     ``resolved.engd_plan``.
+
+    ``freeze_phys`` holds the physical parameters of an inversion fixed: their columns
+    leave the Gauss–Newton system (their rows and columns of :math:`G` are replaced by the
+    network block's mean curvature on the diagonal, their columns of :math:`\hat J` by
+    zeros), so the step is the network's own Gauss–Newton step at the current physical
+    values — the forward solve at a given parameter set.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from .meshenv import shard_like_params
+    from .models import flatten_state
+
+    s = cfg.engd
+    mode = resolved.engd_plan.mode
+    direction = resolved.engd_plan.direction
+    param_shardings = shard_like_params(env, model_bundle.pspec_of_shape, model_bundle.params0)
+    pm = phys_mask(model_bundle.params0)
+    has_phys = bool(pm.any())
+    pm_j = jnp.asarray(pm)
+    use_phys = has_phys and s.damping_mode == "marquardt_phys"
+
+    @jax.jit
+    def step(params, opt_state, w, win):
+        params = jax.lax.with_sharding_constraint(params, param_shardings)
+        params = jax.tree.map(lambda x: x.astype(jnp.float64), params)
+        theta, unflatten = flatten_state(params)
+
+        r_of, group_fns = _row_ops(rows_fn, unflatten, w, win)
+        objective = lambda th: jnp.sum(r_of(th) ** 2)
+        phys = pm_j if use_phys else None
+
+        if mode == "dense":
+            r0, G, grad = _assemble_dense(r_of, group_fns, theta, s, direction)
+            if freeze_phys and has_phys:
+                keep = (~pm_j).astype(G.dtype)
+                d_net = jnp.sum(jnp.diag(G) * keep) / jnp.maximum(jnp.sum(keep), 1.0)
+                G = G * keep[:, None] * keep[None, :] + jnp.diag((1.0 - keep) * d_net)
+                grad = grad * keep
+            psi, eps, M = solve_dense(G, grad, s, phys=None if freeze_phys else phys)
+        else:
+            r0, J = _assemble_rows(r_of, group_fns, theta, s, direction)
+            if freeze_phys and has_phys:
+                J = J * (~pm_j).astype(J.dtype)[None, :]
+            psi, eps, grad, M = solve_rowspace(J, r0, s, phys=None if freeze_phys else phys)
+
+        theta_new, eta, loss_new = grid_line_search(objective, theta, psi, s)
+        aux = EngdAux(eta=eta, eps=eps,
+                      psi_norm=jnp.linalg.norm(psi),
+                      grad_norm=jnp.linalg.norm(grad),
+                      loss=loss_new,
+                      d_eff=effective_dim(M, eps) if s.track_deff
+                      else jnp.asarray(jnp.nan, theta.dtype))
+        return unflatten(theta_new), opt_state, loss_new, aux
+
+    return step
+
+
+def make_spring_step(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
+                     rows_fn: Callable, model_bundle, env,
+                     spring_cfg: SpringConfig) -> tuple[Callable, Callable]:
+    r"""
+    The jitted SPRING step and its state initializer:
+    ``step(params, SpringState, w, win) -> (params', SpringState', loss, EngdAux)``,
+    ``init_spring_state() -> SpringState``.
+
+    Identical to :func:`make_engd_step` through the Gramian assembly, then the
+    solve's right-hand side is shifted by the previous direction and the result
+    accumulated (see :class:`SpringConfig` for the derivation):
+
+    .. math::
+
+        \phi^k
+        \;=\;
+        \mu\,\phi^{k-1}
+        + \bigl(G_k + \varepsilon I\bigr)^{-1}
+          \bigl(\nabla_\theta\mathcal{L}_k - \mu\,G_k\,\phi^{k-1}\bigr).
+
+    The shifted right-hand side costs one matrix–vector product — :math:`P \times P`
+    against :math:`G` in the dense regime, :math:`N \times P` against :math:`\hat J`
+    in the row-space one — so a SPRING iteration is the same :math:`\min(N, P)` AD
+    sweeps as a plain ENGD one; the momentum is free relative to the assembly.
+    Writing the shift this way (rather than as
+    :math:`\nabla\mathcal{L} + \varepsilon\mu\phi^{k-1}`, the algebraically identical
+    form) keeps :math:`\varepsilon` entirely inside the solver, so the damping
+    escalation and the Jacobi/Marquardt mode apply unchanged.
+
+    **Both solve regimes are supported.** Row-space is selected exactly when
+    :math:`P > N` — which is the norm under per-iteration resampling, where each
+    window is a small stochastic subset — and there the shift is carried by
+    :func:`solve_rowspace`'s ``row_shift`` via the push-through identity, so
+    :math:`\phi` is recovered in full :math:`P`-space without materializing
+    :math:`G`. The two paths are algebraically identical for a given
+    :math:`\varepsilon`.
+
+    ``eta`` in the returned :class:`EngdAux` is the realized step scale —
+    the line-search step when ``line_search`` is set, otherwise
+    :math:`\min(\eta, \sqrt{C}/\Vert\hat\phi^k\Vert)` — and ``psi_norm`` is
+    :math:`\Vert\hat\phi^k\Vert`, the norm of the applied direction.
+
+    Wire it into a built pipeline with :func:`modules.pipeline.with_spring`.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from .meshenv import shard_like_params
+    from .models import flatten_state
+
+    s = cfg.engd
+    mode = resolved.engd_plan.mode
+    direction = resolved.engd_plan.direction
+    mu = spring_cfg.momentum
+    param_shardings = shard_like_params(env, model_bundle.pspec_of_shape, model_bundle.params0)
+
+    def init_spring_state() -> SpringState:
+        p64 = jax.tree.map(lambda x: x.astype(jnp.float64), model_bundle.params0)
+        theta0, _ = flatten_state(p64)
+        return SpringState(phi=jnp.zeros_like(theta0), step=jnp.zeros((), jnp.int32))
+
+    @jax.jit
+    def step(params, opt_state: SpringState, w, win):
+        params = jax.lax.with_sharding_constraint(params, param_shardings)
+        params = jax.tree.map(lambda x: x.astype(jnp.float64), params)
+        theta, unflatten = flatten_state(params)
+
+        r_of, group_fns = _row_ops(rows_fn, unflatten, w, win)
+        objective = lambda th: jnp.sum(r_of(th) ** 2)
+
+        phi_prev = opt_state.phi
+        k = opt_state.step + 1
+
+        if mode == "dense":
+            r0, G, grad = _assemble_dense(r_of, group_fns, theta, s, direction)
+            psi, eps, _M = solve_dense(G, grad - mu * (G @ phi_prev), s)
+        else:
+            # push-through: the shifted RHS lives in J's row space, so the momentum
+            # never needs the P x P Gramian -- one N x P matvec instead
+            r0, J = _assemble_rows(r_of, group_fns, theta, s, direction)
+            psi, eps, grad, _M = solve_rowspace(J, r0, s, row_shift=mu * (J @ phi_prev))
+        phi = mu * phi_prev + psi
+
+        if spring_cfg.bias_correction:
+            corr = jnp.sqrt(1.0 - jnp.asarray(mu, theta.dtype) ** (2 * k))
+            phi_hat = phi / (corr + 1e-16)
+        else:
+            phi_hat = phi
+        phi_hat = jnp.where(jnp.isfinite(phi_hat), phi_hat, 0.0)
+
+        if spring_cfg.line_search:
+            theta_new, eta, loss_new = grid_line_search(objective, theta, phi_hat, s)
+        else:
+            nrm = jnp.linalg.norm(phi_hat)
+            eta = jnp.minimum(jnp.asarray(spring_cfg.lr, theta.dtype),
+                              jnp.sqrt(spring_cfg.norm_constraint) / (nrm + 1e-16))
+            theta_new = theta - eta * phi_hat
+            loss_new = objective(theta_new)
+
+        aux = EngdAux(eta=eta, eps=eps,
+                      psi_norm=jnp.linalg.norm(phi_hat),
+                      grad_norm=jnp.linalg.norm(grad),
+                      loss=loss_new,
+                      d_eff=effective_dim(G, eps) if s.track_deff
+                      else jnp.asarray(jnp.nan, theta.dtype))
+        return unflatten(theta_new), SpringState(phi=phi, step=k), loss_new, aux
+
+    return step, init_spring_state
+
+
+def compute_scores(psi, theta, ema, mask_cfg: MaskConfig):
+    r"""
+    Per-parameter importance scores for the masked step (and the updated EMA).
+
+    .. math::
+
+        s_i = |\psi_i|, \qquad
+        s_i = |\psi_i\,\theta_i|, \qquad
+        s_i = \rho\,\mathrm{ema}_i + (1 - \rho)\,|\psi_i|
+
+    for ``score_type`` ``"abs_psi"`` / ``"abs_psi_theta"`` / ``"ema_abs_psi"``
+    respectively. Returns ``(scores, ema_new)``; the EMA accumulator advances
+    only under the EMA score (the other two pass it through unchanged).
+    """
+    import jax.numpy as jnp
+
+    if mask_cfg.score_type == "ema_abs_psi":
+        ema_new = mask_cfg.ema_decay * ema + (1.0 - mask_cfg.ema_decay) * jnp.abs(psi)
+        return ema_new, ema_new
+    if mask_cfg.score_type == "abs_psi_theta":
+        return jnp.abs(psi * theta), ema
+    return jnp.abs(psi), ema
+
+
+def mask_from_scores(scores, select_k_frac: float, select_k: str = "Top"):
+    r"""
+    The binary top-:math:`k` (or bottom-:math:`k`) selection mask
+
+    .. math::
+
+        M_i = \mathbb{1}\bigl[\, s_i \text{ is among the top-}k\text{ fraction}
+        \text{ of } \{s_j\}_{j=1}^{P} \,\bigr],
+        \qquad
+        k = \max\bigl(1, \operatorname{round}(\texttt{select\_k\_frac}\cdot P)\bigr)
+
+    built by scattering ones at the ``jax.lax.top_k`` indices of the scores
+    (negated scores for the bottom fraction), so exactly :math:`k` entries are
+    selected even under ties.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    p = scores.shape[0]
+    k = max(1, int(round(select_k_frac * p)))
+    ranked = scores if select_k == "Top" else -scores
+    _, idx = jax.lax.top_k(ranked, k)
+    return jnp.zeros_like(scores).at[idx].set(1.0)
+
+
+def make_masked_engd_step(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
+                          rows_fn: Callable, model_bundle, env,
+                          mask_cfg: MaskConfig) -> tuple[Callable, Callable]:
+    r"""
+    The jitted masked ENGD step and its state initializer:
+    ``step(params, MaskState, w, win) -> (params', MaskState', loss, EngdAux)``,
+    ``init_mask_state() -> MaskState``.
+
+    Identical to :func:`make_engd_step` through the solve for :math:`\psi`
+    (same regime dispatch, damping, and float64 flattened vector), then the
+    :class:`MaskConfig` scoring/selection restricts the line-searched update to
+    the masked direction :math:`M \odot \psi` (see :class:`MaskConfig` for the
+    update equations). The unselected parameters are bitwise unchanged by
+    construction (:math:`\theta - \eta \cdot 0 = \theta`).
+
+    The cross-iteration EMA accumulator and held mask ride the ``opt_state``
+    slot as a :class:`MaskState`; wire both into a built pipeline with
+    :func:`modules.pipeline.with_masked_engd`.
     """
     import jax
     import jax.numpy as jnp
@@ -874,8 +1197,15 @@ def make_engd_step(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
     direction = resolved.engd_plan.direction
     param_shardings = shard_like_params(env, model_bundle.pspec_of_shape, model_bundle.params0)
 
+    def init_mask_state() -> MaskState:
+        p64 = jax.tree.map(lambda x: x.astype(jnp.float64), model_bundle.params0)
+        theta0, _ = flatten_state(p64)
+        return MaskState(ema=jnp.zeros_like(theta0),
+                         mask=jnp.ones_like(theta0),
+                         initialized=jnp.zeros((), bool))
+
     @jax.jit
-    def step(params, opt_state, w, win):
+    def step(params, opt_state: MaskState, w, win):
         params = jax.lax.with_sharding_constraint(params, param_shardings)
         params = jax.tree.map(lambda x: x.astype(jnp.float64), params)
         theta, unflatten = flatten_state(params)
@@ -890,15 +1220,23 @@ def make_engd_step(cfg: RunConfig, resolved: Resolved, loss_fn: Callable,
             r0, J = _assemble_rows(r_of, group_fns, theta, s, direction)
             psi, eps, grad, M = solve_rowspace(J, r0, s)
 
-        theta_new, eta, loss_new = grid_line_search(objective, theta, psi, s)
+        scores, ema_new = compute_scores(psi, theta, opt_state.ema, mask_cfg)
+        mask_fresh = mask_from_scores(scores, mask_cfg.select_k_frac, mask_cfg.select_k)
+        if mask_cfg.mask_update == "fixed":
+            mask = jnp.where(opt_state.initialized, opt_state.mask, mask_fresh)
+        else:
+            mask = mask_fresh
+        psi_m = mask * psi
+
+        theta_new, eta, loss_new = grid_line_search(objective, theta, psi_m, s)
         aux = EngdAux(eta=eta, eps=eps,
-                      psi_norm=jnp.linalg.norm(psi),
+                      psi_norm=jnp.linalg.norm(psi_m),
                       grad_norm=jnp.linalg.norm(grad),
                       loss=loss_new,
+                      mask_frac=jnp.mean(mask),
                       d_eff=effective_dim(M, eps) if s.track_deff
                       else jnp.asarray(jnp.nan, theta.dtype))
-        return unflatten(theta_new), opt_state, loss_new, aux
+        new_state = MaskState(ema=ema_new, mask=mask, initialized=jnp.ones((), bool))
+        return unflatten(theta_new), new_state, loss_new, aux
 
-    return step
-
-
+    return step, init_mask_state

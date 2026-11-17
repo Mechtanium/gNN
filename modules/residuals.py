@@ -19,7 +19,7 @@ where:
 - :math:`\Phi_\alpha = p_\alpha - \gamma_\alpha z`: the phase potential with gravity gradient :math:`\gamma_\alpha`.
 - :math:`T_\alpha = f_\alpha\, k`: phase mobility times absolute permeability, with the element mobility **potential-upwinded** (below).
 - :math:`C_F, C_{rb}`: the FIELD Darcy and rb/ft³ unit constants.
-- :math:`q_\alpha(t)`: the **time-resolved well stimulation** — under ``well_model=closed_form`` the realized rates as data (:class:`pinnlab.wells.WellForcing`), under ``predicted`` the Peaceman prediction :math:`q_{\alpha,p}(\theta, t)` of the trainable :math:`p_{wf}` head (:class:`pinnlab.wells.PredictedForcing`); either way conservative nodal loads or a mollified density, with the gas entry the total surface gas so the component bookkeeping is exact.
+- :math:`q_\alpha(t)`: the **time-resolved well stimulation** — under ``well_model=closed_form`` the realized rates as data (:class:`modules.wells.WellForcing`), under ``predicted`` the Peaceman prediction :math:`q_{\alpha,p}(\theta, t)` of the trainable :math:`p_{wf}` head (:class:`modules.wells.PredictedForcing`); either way conservative nodal loads or a mollified density, with the gas entry the total surface gas so the component bookkeeping is exact.
 
 The exposed residual channels are the IMPES-style recombination of the
 component balances,
@@ -119,7 +119,7 @@ from .config import BackpropDesign, ResidualDesign, RunConfig
 from .casedata import CaseData
 from .meshenv import MeshEnv
 from .physics import Primaries
-from .spectral import SpectralBundle, raw_modes
+from .spectral import SpectralBundle, raw_centroid_modes, raw_modes
 
 # Smooth potential-upwinding sharpness [1/psi]: strong donor weighting for
 # element potential drops beyond a few psi, near-central blending below.
@@ -130,12 +130,15 @@ BETA_UPWIND = 1.0
 class Extras:
     """Optional inversion/observation bindings threaded through the builders."""
 
-    invm: Any = None                # pinnlab.inversion.Inversion | None
-    pack: Any = None                # pinnlab.wells.WellPack | None
-    forcing: Any = None             # pinnlab.wells.WellForcing | PredictedForcing | None
+    invm: Any = None                # modules.inversion.Inversion | None
+    pack: Any = None                # modules.wells.WellPack | None
+    forcing: Any = None             # modules.wells.WellForcing | PredictedForcing | None
     mb_obs: Any = None              # (t_probe, q_cum, n_ref) material-balance observations
-    head: Any = None                # pinnlab.wells.WellHead | None (predicted well model)
+    head: Any = None                # modules.wells.WellHead | None (predicted well model)
     forcing_calib: Any = None       # data-driven WellForcing used by calibrate_scales
+    aquifer: Any = None             # modules.aquifer.AquiferPack | None
+    aq_head: Any = None             # modules.aquifer.AquiferHead | None
+    family: Any = None              # modules.family.FamilyTables | None (a family of reservoirs)
 
 
 @dataclass
@@ -158,6 +161,10 @@ class ResidualOps:
     forcing: Any = None                   # the interior forcing the residuals closed over
     node_row_weight: Any = None           # (n_nodes,) w_i of the nodal rows (fem_nodal)
     pde_hybrid: Callable | None = None    # (params, t[, prec]) -> flat block-balanced hybrid rows
+    aqu_arr: Callable | None = None       # params -> aquifer material-balance rows (aqu group)
+    aquifer: Any = None                   # modules.aquifer.AquiferOps | None
+    mass_balance: Callable | None = None  # (params, t[, forcing_override]) -> (net (3,), gross (3,)) whole-mesh balance
+    pde_forcing: Callable | None = None   # (params, t[, forcing_override]) -> the loads' part of the pde rows
 
 
 @dataclass
@@ -168,6 +175,7 @@ class Scales:
     bc_scale: Any | None            # (3,) per-phase boundary flux std (chain_rule BC group only)
     state_scale: Any                # (4,) primaries span
     well_scale: Any | None = None   # (s_bhp, s_qo, s_qw, s_qg) observation spans (well group)
+    mb_coef: Any | None = None      # (3,) B_k^ref / s: the material-balance rows' factors (mb group)
 
 
 def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
@@ -181,6 +189,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
     provided, the pack and forcing are self-provisioned from the case so every
     entry point drives the interior balances with the realized rates.
     """
+    from .encodings import base_cell
     import jax
     import jax.numpy as jnp
     from jax import jacfwd, jacrev
@@ -202,7 +211,9 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
     encoder = prim.encoder
     primaries_point = prim.primaries_point
 
-    # --- well forcing: realized rates as data ----------------------------------------------
+    # --- well forcing: realized rates as data, or the predicted Peaceman source ------------
+    from .config import predicted_well
+
     from . import wells as wells_mod
 
     local_centroids = spec.centroids if spec is not None else jnp.asarray(case.centroids, jnp.float32)
@@ -211,18 +222,29 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
     forcing = extras.forcing if extras is not None else None
     forcing_calib = extras.forcing_calib if extras is not None else None
     well_ops = None
-    if pack is None:
+    if cfg.residual_design is not ResidualDesign.DATA_ONLY and pack is None:
         pack = wells_mod.build_well_pack(cfg, case)
     if pack is not None:                       # well_predict backs the diagnostics on every PDE run
         wi_mult = invm.k_mult if invm is not None else None
+        if predicted_well(cfg) and head is None:
+            head = wells_mod.WellHead.from_pack(pack, case)
         well_ops = wells_mod.make_well_residual(
             cfg, case, pack, prim, local_centroids, eff_tables=eff, wi_mult_of=wi_mult,
             head=head)
-    if True:
+    if cfg.residual_design is not ResidualDesign.DATA_ONLY:
         if forcing_calib is None:
             forcing_calib = wells_mod.build_forcing(pack, case)
         if forcing is None:
-            forcing = forcing_calib
+            forcing = well_ops.forcing if predicted_well(cfg) else forcing_calib
+
+    # --- aquifer influx: a further source of the water balance (node-wise residuals) --------
+    aq_ops = None
+    if extras is not None and extras.aquifer is not None:
+        from . import aquifer as aq_mod
+
+        aq_ops = aq_mod.make_aquifer_ops(extras.aquifer, extras.aq_head, prim, local_centroids,
+                                         int(case.n_nodes),
+                                         strength_of=invm.aq_strength if invm is not None else None)
 
     def _recombine(Rw, Ro, Rg, b_w, b_o, b_g, rs):
         """(R_w, R_o, R_g) component rows -> (R_P, R_W, R_G) channels (stacked last axis)."""
@@ -238,7 +260,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
         p_o, s_w, s_g, rs = primaries_point(params, xt, *enc_args)
         p_w = p_o - cap_pres_ow(s_w, tab)
         p_g = p_o + cap_pres_go(s_g, tab)
-        b_o, b_w, b_g = fvf_oil(rs, tab), fvf_water(p_w, tab), fvf_gas(p_g, tab)
+        b_o, b_w, b_g = fvf_oil(rs, tab, p_o), fvf_water(p_w, tab), fvf_gas(p_g, tab)
         rho_w = dens_w / b_w
         rho_o = (dens_o + rs * dens_g) / b_o
         rho_g = dens_g / b_g
@@ -270,7 +292,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
         p_w = p_o - cap_pres_ow(s_w, tab)
         p_g = p_o + cap_pres_go(s_g, tab)
         phi = case.poro_of_z(xt[2]) * (1.0 + rock_cr * (p_o - rock_pref))
-        b_o, b_w, b_g = fvf_oil(rs, tab), fvf_water(p_w, tab), fvf_gas(p_g, tab)
+        b_o, b_w, b_g = fvf_oil(rs, tab, p_o), fvf_water(p_w, tab), fvf_gas(p_g, tab)
         return jnp.stack([phi * s_w / b_w, phi * s_o / b_o, phi * (s_g / b_g + rs * s_o / b_o)])
 
     def pde_point(params, xt, *enc_args):
@@ -283,14 +305,14 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
         p_o, s_w, s_g, rs = primaries_point(params, xt, *enc_args)
         p_w = p_o - cap_pres_ow(s_w, tab)
         p_g = p_o + cap_pres_go(s_g, tab)
-        b_o, b_w, b_g = fvf_oil(rs, tab), fvf_water(p_w, tab), fvf_gas(p_g, tab)
+        b_o, b_w, b_g = fvf_oil(rs, tab, p_o), fvf_water(p_w, tab), fvf_gas(p_g, tab)
         q = forcing.density_at(xt[:3], xt[3], params)                      # (w, o, g)
         R = rb_ft3 * dUdt - c_f * divF - jnp.asarray(q, dUdt.dtype)
         return _recombine(R[0], R[1], R[2], b_w, b_o, b_g, rs)
 
     needs_fem = spec is not None and cfg.backprop_design is BackpropDesign.FEM_NODAL
     pde_fem = pde_fem_ref = primaries_nodes = nodes_P_dPdt = None
-    fem_parts = None
+    fem_parts = mass_balance = None
 
     if needs_fem:
         from .evaluators import make_nodal_evaluator
@@ -324,9 +346,13 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
         sqrt_w = jnp.sqrt(node_w)
 
         def _q_nodes(t, prec, params=None, frc=None):
-            """Conservative nodal loads (n_nodes, 3) at time t, residual order (w, o, g)."""
+            """Conservative nodal loads (n_nodes, 3) at time t, residual order (w, o, g): the
+            wells', plus the aquifers' water influx where the deck defines aquifers."""
             frc = forcing if frc is None else frc
-            return jnp.asarray(w_nodes, prec) @ jnp.asarray(frc.rate_perf_at(t, params), prec)
+            q = jnp.asarray(w_nodes, prec) @ jnp.asarray(frc.rate_perf_at(t, params), prec)
+            if aq_ops is not None and params is not None:
+                q = q.at[:, 0].add(jnp.asarray(aq_ops.loads_at(params, t), prec))
+            return q
 
         def _stiff_mv(f_hex, Phi, prec=None, k_hex=None):
             """Matrix-free per-phase stiffness action K(f) @ Phi from a per-hex mobility.
@@ -365,7 +391,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
             p_w = p_o - cap_pres_ow(s_w, tab)
             p_g = p_o + cap_pres_go(s_g, tab)
             phi = jnp.asarray(poro_nodes, Pn.dtype) * (1.0 + rock_cr * (p_o - rock_pref))
-            b_o, b_w, b_g = fvf_oil(rs, tab), fvf_water(p_w, tab), fvf_gas(p_g, tab)
+            b_o, b_w, b_g = fvf_oil(rs, tab, p_o), fvf_water(p_w, tab), fvf_gas(p_g, tab)
             return jnp.stack([phi * s_w / b_w, phi * s_o / b_o,
                               phi * (s_g / b_g + rs * s_o / b_o)], axis=1)
 
@@ -377,7 +403,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
             p_o, s_w, s_g, rs = Pn[:, 0], Pn[:, 1], Pn[:, 2], Pn[:, 3]
             p_w = p_o - cap_pres_ow(s_w, tab)
             p_g = p_o + cap_pres_go(s_g, tab)
-            b_o, b_w, b_g = fvf_oil(rs, tab), fvf_water(p_w, tab), fvf_gas(p_g, tab)
+            b_o, b_w, b_g = fvf_oil(rs, tab, p_o), fvf_water(p_w, tab), fvf_gas(p_g, tab)
             rho_w = dens_w / b_w
             rho_o = (dens_o + rs * dens_g) / b_o
             rho_g = dens_g / b_g
@@ -401,18 +427,20 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
             R = _recombine(R[:, 0], R[:, 1], R[:, 2], b_w, b_o, b_g, rs)
             return R * jnp.asarray(sqrt_w, R.dtype)[:, None]
 
-        def fem_parts(params, t, prec=None, forcing_override=None):
+        def fem_parts(params, t, prec=None, forcing_override=None, k_override=None, m=None):
             """Shared fem_nodal core: state factors, storage rate, flux divergence, loads.
 
             ``forcing_override`` swaps the interior forcing for one evaluation (the
-            scale calibration reads the data-driven forcing at :math:`\theta_0`).
+            scale calibration reads the data-driven forcing at :math:`\theta_0`);
+            ``k_override`` (n_hex, 3) and ``m`` are one sample's permeability and whitened
+            properties when the rows belong to a family of reservoirs.
             """
             prec = prec_fem if prec is None else prec
             tab = eff(params)
-            k_eff = k_of(params) if k_of is not None else None
+            k_eff = k_override if k_override is not None else (k_of(params) if k_of is not None else None)
             if k_eff is not None:
                 k_eff = jnp.asarray(k_eff, prec)
-            P4, dP4 = nodes_P_dPdt(params, t)
+            P4, dP4 = nodes_P_dPdt(params, t, m)
             P4, dP4 = jnp.asarray(P4, prec), jnp.asarray(dP4, prec)
 
             def _fields(Pn):
@@ -420,7 +448,7 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
                 s_o = 1.0 - s_w - s_g
                 p_w = p_o - cap_pres_ow(s_w, tab)
                 p_g = p_o + cap_pres_go(s_g, tab)
-                b_o, b_w, b_g = fvf_oil(rs, tab), fvf_water(p_w, tab), fvf_gas(p_g, tab)
+                b_o, b_w, b_g = fvf_oil(rs, tab, p_o), fvf_water(p_w, tab), fvf_gas(p_g, tab)
                 phi = jnp.asarray(poro_nodes, Pn.dtype) * (1.0 + rock_cr * (p_o - rock_pref))
                 U = jnp.stack([phi * s_w / b_w, phi * s_o / b_o,
                                phi * (s_g / b_g + rs * s_o / b_o)], axis=1)
@@ -449,18 +477,47 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
             Q = _q_nodes(t, prec, params, forcing_override)
             return (b_w, b_o, b_g, rs), dUdt, div, Q
 
-        def _nodal_channels(params, t, prec, forcing_override=None):
+        def mass_balance(params, t, forcing_override=None):
+            r"""
+            The nodal residual summed over the mesh: each component's whole-reservoir
+            balance at time ``t``, with the gross load beside it,
+
+            .. math::
+
+                \sum_i R_{ik} \;=\; \sum_i V^L_i\,\partial_t U_{ik} \;-\; \sum_i Q_{ik},
+                \qquad
+                g_k \;=\; \sum_i \lvert Q_{ik} \rvert
+
+            where:
+            - :math:`\sum_i V^L_i\,\partial_t U_{ik} = \tfrac{d}{dt}\sum_i (M U)_{ik}`: the rate of change of the component's inventory (the lumped volumes are the consistent mass's row sums).
+            - the flux term is absent because :math:`\sum_i (K[f]\Phi)_{ik} = 0` — every element's stiffness rows sum to zero, so the fluxes only move a component between nodes; leaving it out also keeps its rounding out of the sum.
+            - :math:`\sum_i Q_{ik}`: the net load of the wells and aquifers; :math:`g_k`: its gross magnitude, the scale's ingredient (:func:`calibrate_scales`).
+
+            Returns ``(net, gross)``, each ``(3,)`` in residual order (water, oil, gas).
+            """
+            _, dUdt, _, Q = fem_parts(params, t, forcing_override=forcing_override)
+            accum = jnp.asarray(vlump, dUdt.dtype)[:, None] * dUdt
+            return jnp.sum(accum, axis=0) - jnp.sum(Q, axis=0), jnp.sum(jnp.abs(Q), axis=0)
+
+        def _nodal_channels(params, t, prec, forcing_override=None, k_override=None, m=None):
             """Weighted nodal channels sqrt(w_i) T(u)(V dU/dt + K Phi - Q) — (n_nodes, 3)."""
-            (b_w, b_o, b_g, rs), dUdt, div, Q = fem_parts(params, t, prec, forcing_override)
+            (b_w, b_o, b_g, rs), dUdt, div, Q = fem_parts(params, t, prec, forcing_override, k_override, m)
             accum = jnp.asarray(vlump, prec)[:, None] * dUdt
             R = accum + div - Q
             R = _recombine(R[:, 0], R[:, 1], R[:, 2], b_w, b_o, b_g, rs)
             return R * jnp.asarray(sqrt_w, R.dtype)[:, None]
 
-        def pde_fem(params, t, prec=None, forcing_override=None):
+        def pde_fem_forcing(params, t, forcing_override=None):
+            """The loads' part of the nodal channels, sqrt(w_i) T(u)(-Q(t)) — (n_nodes, 3); the
+            scale of the rows under ``pde_scale="forcing"`` (:func:`calibrate_scales`)."""
+            (b_w, b_o, b_g, rs), _, _, Q = fem_parts(params, t, forcing_override=forcing_override)
+            R = _recombine(-Q[:, 0], -Q[:, 1], -Q[:, 2], b_w, b_o, b_g, rs)
+            return R * jnp.asarray(sqrt_w, R.dtype)[:, None]
+
+        def pde_fem(params, t, prec=None, forcing_override=None, k_override=None, m=None):
             """fem_nodal control-volume channels (n_nodes, 3): sqrt(w_i) T(u)(V dU/dt + K Phi - Q(t))."""
             prec = prec_fem if prec is None else prec
-            R = _nodal_channels(params, t, prec, forcing_override)
+            R = _nodal_channels(params, t, prec, forcing_override, k_override, m)
             if case.n_nodes % env.data_dim:
                 # uneven node axis: the hint would device_put eagerly (IndivisibleError);
                 # sharding propagates from the evaluator's padded row constraint instead
@@ -468,9 +525,9 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
             return jax.lax.with_sharding_constraint(R, env.nd(P("data", None)))
 
     # ---------------- spectral projection (Galerkin | block-norm) and the hybrid ------------
-    pde_spectral = pde_hybrid = None
+    pde_spectral = pde_hybrid = pde_spectral_forcing = None
     blocknorm = cfg.spectral_projection == "blocknorm"
-    if True:
+    if cfg.residual_design in (ResidualDesign.SPECTRAL_PDE, ResidualDesign.HYBRID_PDE):
         sqrt_mu = None
         if spec is not None and spec.mu is not None:
             sqrt_mu = jnp.sqrt(jnp.asarray(spec.mu))
@@ -488,16 +545,22 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
                 Rs = jnp.asarray(v_raw, R.dtype).T @ R
                 return Rs * jnp.asarray(sqrt_mu, R.dtype)[:, None]
 
-            def _consistent_channels(params, t, forcing_override=None):
-                (b_w, b_o, b_g, rs), dUdt, div, Q = fem_parts(params, t, forcing_override=forcing_override)
+            def _consistent_channels(params, t, forcing_override=None, k_override=None, m=None):
+                (b_w, b_o, b_g, rs), dUdt, div, Q = fem_parts(params, t, forcing_override=forcing_override,
+                                                              k_override=k_override, m=m)
                 storage = _mass_mv(dUdt)                                  # consistent M dU/dt
                 R = storage + div - Q
                 return _recombine(R[:, 0], R[:, 1], R[:, 2], b_w, b_o, b_g, rs)
 
-            def pde_spectral(params, t, cells=None, forcing_override=None):
-                return _project(_consistent_channels(params, t, forcing_override))   # (n_eig, 3)
+            def pde_spectral(params, t, cells=None, forcing_override=None, k_override=None, m=None):
+                return _project(_consistent_channels(params, t, forcing_override, k_override, m))   # (n_eig, 3)
 
-            if False:   # the hybrid (node-wise saturation) rows are not built here
+            def pde_spectral_forcing(params, t, forcing_override=None):
+                """The loads' part of the projected rows, the projection of T(u)(-Q(t)) — (n_eig, 3)."""
+                (b_w, b_o, b_g, rs), _, _, Q = fem_parts(params, t, forcing_override=forcing_override)
+                return _project(_recombine(-Q[:, 0], -Q[:, 1], -Q[:, 2], b_w, b_o, b_g, rs))
+
+            if cfg.residual_design is ResidualDesign.HYBRID_PDE:
                 n_p_rows = int(cfg.n_eig)
                 n_s_rows = 2 * int(case.n_nodes)
                 n_tot = n_p_rows + n_s_rows
@@ -519,13 +582,41 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
 
                 pde_hybrid.balance = (bal_p, bal_s)
 
+        else:
+            v_c_raw = raw_centroid_modes(spec)                           # (n_cells, n_eig)
+            vol_c = jnp.sum(spec.static["JxW"], axis=1)                  # (n_cells,) cell volumes
+            centroids = spec.centroids
+            n_cells = case.n_cells
+
+            def pde_spectral(params, t, cells=None, forcing_override=None):
+                ci = jnp.arange(n_cells) if cells is None else cells
+                xt = jnp.concatenate([centroids[base_cell(encoder, ci)],
+                                      jnp.broadcast_to(jnp.reshape(t, (1,)), (ci.shape[0],))[:, None]],
+                                     axis=1)
+                enc_args = encoder.gather_args(ci)
+                R = jax.vmap(lambda x, *a: pde_point(params, x, *a))(xt, *enc_args)  # (|S|, 3)
+                w = (vol_c[ci] * (n_cells / ci.shape[0]))[:, None]
+                if blocknorm:
+                    mu = jnp.asarray(sqrt_mu, R.dtype)[:, None] ** 2
+                    ss = jnp.abs(jnp.asarray(v_c_raw, R.dtype)[ci]).T @ (R * R * jnp.asarray(w, R.dtype))
+                    return jnp.sqrt(mu * ss + jnp.asarray(1e-30, R.dtype))
+                Rs = jnp.asarray(v_c_raw, R.dtype)[ci].T @ (R * jnp.asarray(w, R.dtype))
+                return Rs * jnp.asarray(sqrt_mu, R.dtype)[:, None]
 
     # ---------------- well observables and inversion penalties -------------------------------
     well_arr = well_predict = reg_arr = ctrl_arr = ctrl_parts = None
     if well_ops is not None:
         well_arr, well_predict = well_ops.well_arr, well_ops.well_predict
         ctrl_arr, ctrl_parts = well_ops.ctrl_arr, well_ops.ctrl_parts
-    use_point = True
+    if invm is not None:
+        from .config import reg_active
+        from .inversion import make_reg_rows
+
+        if reg_active(cfg):
+            reg_arr = make_reg_rows(cfg, invm, prim, case, spec, local_centroids,
+                                    mb_obs=extras.mb_obs if extras is not None else None)
+
+    use_point = cfg.residual_design is not ResidualDesign.DATA_ONLY
     return ResidualOps(
         pde_point=pde_point if use_point else None,
         pde_fem=pde_fem,
@@ -543,6 +634,12 @@ def make_residuals(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None,
         forcing=forcing,
         node_row_weight=(node_w if needs_fem else None),
         pde_hybrid=pde_hybrid,
+        aqu_arr=None if aq_ops is None else aq_ops.aqu_arr,
+        aquifer=aq_ops,
+        mass_balance=mass_balance,
+        pde_forcing=(pde_spectral_forcing if cfg.residual_design is ResidualDesign.SPECTRAL_PDE
+                     else pde_fem_forcing if (needs_fem and cfg.residual_design is ResidualDesign.CARTESIAN_PDE)
+                     else None),
     )
 
 
@@ -569,17 +666,69 @@ def state_row_mask(cfg: RunConfig, y_ref):
     - :math:`R_{so}`: the dissolved gas-oil ratio, a property *of the oil phase* — in a cell without oil (the water leg below the contact, :math:`S_w = 1`) the simulator's restart value is a bookkeeping placeholder, not a state: SPE2's water leg reports :math:`R_s = 1.39` at :math:`t = 0` and :math:`1.41`–:math:`1.42` from the first report step on, a discontinuity in time that no smooth ansatz can honour and that otherwise floors the ``data`` and ``ic`` losses.
     - :math:`\epsilon_o` (``RS_OIL_EPS``): the oil-saturation threshold below which the channel is masked.
 
-    ``"all"`` (the default) returns unit weights, i.e. the historical objective. Returns an
+    ``"all"`` (the default) keeps every channel. A channel the reference records as missing
+    (NaN — a cell-state observation the monitoring program did not make,
+    :func:`modules.casedata.apply_monitoring`) has weight zero under either rule. Returns an
     array broadcastable against the residual, ``(..., 4)``.
     """
     import jax.numpy as jnp
 
     y = jnp.asarray(y_ref)
-    ones = jnp.ones(y.shape[:-1] + (1,), y.dtype)
+    seen = jnp.isfinite(y).astype(y.dtype)
     if cfg.rs_supervision != "oil_only":
-        return jnp.ones((4,), y.dtype)
-    has_oil = (1.0 - y[..., 1] - y[..., 2] > RS_OIL_EPS).astype(y.dtype)[..., None]
-    return jnp.concatenate([ones, ones, ones, has_oil], axis=-1)
+        return seen
+    has_oil = (1.0 - y[..., 1] - y[..., 2] > RS_OIL_EPS).astype(y.dtype)
+    return seen * jnp.concatenate([jnp.ones(y.shape[:-1] + (3,), y.dtype), has_oil[..., None]],
+                                  axis=-1)
+
+
+def state_misfit(cfg: RunConfig, S, y_ref, state_scale):
+    r"""
+    The scaled, masked cell-state misfit of the predicted primaries :math:`\mathbf S`,
+
+    .. math::
+
+        \mathbf r \;=\; \mathbf m \odot \frac{\mathbf S - \tilde{\mathbf y}}{\mathbf s},
+        \qquad
+        \tilde y_k \;=\; \begin{cases} y_k & y_k \text{ observed} \\ S_k & y_k \text{ missing} \end{cases}
+
+    where :math:`\mathbf m` is :func:`state_row_mask` and :math:`\mathbf s` the case's state
+    scale; substituting the prediction for a missing channel keeps the row finite (and its
+    gradient zero) where the mask removes it.
+    """
+    import jax.numpy as jnp
+
+    y = jnp.asarray(y_ref)
+    return (S - jnp.where(jnp.isnan(y), S, y)) / state_scale * state_row_mask(cfg, y)
+
+
+# Significant bits kept of a calibrated scale (see _reproducible).
+_SCALE_BITS = 20
+
+
+def _reproducible(x):
+    r"""
+    A calibrated scale rounded to :math:`b` significant bits, so it is the same number in
+    every process.
+
+    .. math::
+
+        s \;=\; 2^{e}\, m,\quad m \in [\tfrac12, 1),
+        \qquad
+        \hat s \;=\; 2^{e}\, \frac{\operatorname{round}\bigl(2^{b} m\bigr)}{2^{b}}
+
+    where:
+    - :math:`s`: a scale computed on the device; the FEM residuals behind it are summed by scatter-adds whose order varies from run to run, so :math:`s` varies in its last bits (about :math:`10^{-9}` relative measured) — and the scales are baked into every compiled step as constants, so each process would compile a different program and miss the persistent compilation cache.
+    - :math:`m, e`: the mantissa and binary exponent of :math:`s`; :math:`\hat s`: the scale the losses use.
+    - :math:`b` (``_SCALE_BITS`` = 20): a relative rounding of about :math:`10^{-6}`, far below any effect on the normalized losses and far above the noise; a value straddling a rounding boundary still differs, rarely.
+    """
+    import jax.numpy as jnp
+    import numpy as onp
+
+    a = onp.asarray(x, onp.float64)
+    m, e = onp.frexp(a)
+    q = onp.ldexp(onp.round(m * 2.0 ** _SCALE_BITS) / 2.0 ** _SCALE_BITS, e)
+    return jnp.asarray(q, jnp.asarray(x).dtype)
 
 
 def calibrate_scales(cfg: RunConfig, groups: tuple[str, ...], ops: ResidualOps,
@@ -590,7 +739,10 @@ def calibrate_scales(cfg: RunConfig, groups: tuple[str, ...], ops: ResidualOps,
     The PDE channels are the recombined (pressure, water, free-gas) rows, so
     the per-channel standard deviations normalize one pressure equation and two
     transport equations — the saturation misfit is visible to the calibration.
+    The device-computed scales are rounded to 20 significant bits (:func:`_reproducible`)
+    so every process bakes the same constants into the compiled steps.
     """
+    from .encodings import base_cell
     import jax
     import jax.numpy as jnp
     from jax import random, vmap
@@ -599,7 +751,7 @@ def calibrate_scales(cfg: RunConfig, groups: tuple[str, ...], ops: ResidualOps,
     centroids = spec.centroids if spec is not None else jnp.asarray(case.centroids, jnp.float32)
 
     def _xt_of(ci, t):
-        return jnp.concatenate([centroids[ci], jnp.reshape(t, (1,))])
+        return jnp.concatenate([centroids[base_cell(encoder, ci)], jnp.reshape(t, (1,))])
 
     # deferred: sampling imports this module, so a module-level import would cycle
     from . import sampling as sampling_mod
@@ -612,7 +764,13 @@ def calibrate_scales(cfg: RunConfig, groups: tuple[str, ...], ops: ResidualOps,
     res_scale = jnp.ones((3,), jnp.float32)
     if "pde" in groups:
         key = random.PRNGKey(seed)
-        if True:
+        if cfg.residual_design is ResidualDesign.HYBRID_PDE:
+            ts = sampling_mod.draw_times(case, key, (4,))
+            r_p, r_s = jax.lax.map(lambda t: ops.pde_hybrid(params0, t, forcing_override=frc), ts)
+            s_p = jnp.std(r_p.reshape(-1)) + 1e-12
+            s_s = jnp.std(r_s.reshape(-1, 2), axis=0) + 1e-12
+            res_scale = jnp.concatenate([s_p[None], s_s])
+        elif cfg.residual_design is ResidualDesign.SPECTRAL_PDE:
             ts = sampling_mod.draw_times(case, key, (4,))
             Rb = jax.lax.map(lambda t: ops.pde_spectral(params0, t, forcing_override=frc), ts)  # (4, n_eig, 3)
             res_scale = jnp.std(Rb.reshape(-1, 3), axis=0) + 1e-12
@@ -640,5 +798,74 @@ def calibrate_scales(cfg: RunConfig, groups: tuple[str, ...], ops: ResidualOps,
     if "well" in groups and extras is not None and extras.pack is not None:
         well_scale = extras.pack.well_scale       # observation spans, set at pack build
 
-    return Scales(res_scale=res_scale, bc_scale=bc_scale, state_scale=case.state_scale,
-                  well_scale=well_scale)
+    if "pde" in groups and cfg.pde_scale == "forcing" and ops.pde_forcing is not None:
+        res_scale = forcing_scale(ops, case, params0, res_scale, frc)
+
+    mb_coef = None
+    if "mb" in groups and ops.mass_balance is not None:
+        mb_coef = _reproducible(mass_balance_coefficients(ops, case, params0, frc))
+    return Scales(res_scale=_reproducible(res_scale),
+                  bc_scale=None if bc_scale is None else _reproducible(bc_scale),
+                  state_scale=case.state_scale, well_scale=well_scale, mb_coef=mb_coef)
+
+
+def forcing_scale(ops: ResidualOps, case: CaseData, params0, random_scale, forcing=None, n_times: int = 16):
+    r"""
+    The physics rows' scale under ``pde_scale="forcing"``: the root-mean-square, over the
+    rows and over the observation window, of the rows' load part alone,
+
+    .. math::
+
+        s_c \;=\; \Bigl\langle \bigl(\mathcal{F}_c(t)\bigr)^2 \Bigr\rangle^{1/2},
+        \qquad
+        \mathcal{F}(t) \;=\; \Pi\bigl[\,\mathsf T(u)\,(-Q(t))\,\bigr]
+
+    where:
+    - :math:`\Pi`: the rows' own map — the Galerkin projection of the projected design, the node weights of the node-wise one; :math:`\mathsf T(u)`: the recombination into the pressure, water and free-gas channels; :math:`Q(t)`: the nodal loads of the wells and aquifers under the observed-rate ``forcing``.
+    - :math:`c`: the channel; a channel the loads leave (nearly) empty — water in a reservoir without water wells — keeps its ``random_scale``, the spread of the rows at the random network.
+
+    A row is then a residual in units of the forcing it has to balance, where the default
+    scale (the spread at a random network, whose spurious fluxes dwarf the wells) makes the
+    rows of a field that ignores the wells small.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    lo, hi = case.t_obs_span()
+    ts = jnp.linspace(lo, hi, n_times + 2, dtype=jnp.float32)[1:-1]
+    F = jax.lax.map(lambda t: ops.pde_forcing(params0, t, forcing_override=forcing), ts)
+    s_f = jnp.sqrt(jnp.mean(jnp.reshape(F, (-1, 3)) ** 2, axis=0))
+    random_scale = jnp.asarray(random_scale, s_f.dtype)
+    return jnp.where(s_f > 1e-6 * random_scale, s_f, random_scale)
+
+
+def mass_balance_coefficients(ops: ResidualOps, case: CaseData, params0, forcing=None, n_times: int = 32):
+    r"""
+    The factors of the material-balance rows, :math:`c_k = B_k^{\mathrm{ref}} / s`, with
+
+    .. math::
+
+        s \;=\; \sum_k B_k^{\mathrm{ref}} \max_{t \in [t_{\mathrm{lo}},\, t_{\mathrm{obs}}]} g_k(t)
+
+    where:
+    - :math:`B_k^{\mathrm{ref}}`: the formation volume factor of component :math:`k` (water, oil, gas) at the mean initial state, which turns a surface rate into a reservoir-volume rate, as the recombined pressure channel does.
+    - :math:`g_k(t)`: the gross well and aquifer load of component :math:`k` (:attr:`ResidualOps.mass_balance`), under the observed-rate ``forcing``; :math:`s`: the reservoir-volume throughput of the wells, read over the observation window only, so a forecast takes no scale from its future.
+
+    A row :math:`c_k \sum_i R_{ik}` is then the component's whole-reservoir imbalance as a
+    share of the throughput — of order one for a field that fails to store what is
+    injected or to give up what is produced.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from modules.utils.blackoil_closures import fvf_gas, fvf_oil, fvf_water
+
+    lo, hi = case.t_obs_span()
+    ts = jnp.linspace(lo, hi, n_times, dtype=jnp.float32)
+    gross = jax.lax.map(lambda t: ops.mass_balance(params0, t, forcing_override=forcing)[1], ts)
+    g = jnp.max(gross, axis=0)
+    y0 = jnp.asarray(case.y_ic)
+    p0, rs0 = jnp.mean(y0[:, 0]), jnp.mean(y0[:, 3])
+    b_ref = jnp.stack([fvf_water(p0, case.tables), fvf_oil(rs0, case.tables, p0), fvf_gas(p0, case.tables)])
+    b_ref = jnp.asarray(b_ref, g.dtype)
+    return b_ref / (jnp.sum(b_ref * g) + 1e-30)

@@ -1,11 +1,26 @@
-"""The extracted path (modules) on the same deck/config/seed as baseline_notebook.py."""
+"""The extracted path (modules) on the same deck, composition and seed as upstream_path.py.
+
+Run with this repository's interpreter:
+
+    .venv/bin/python tests/parity/extracted_path.py <deck> <work dir> <path> <n_iter> <upstream.json>
+
+``<work dir>`` holds copies of the research repository's ``prep_cache`` and
+``spectral_cache`` for the deck, so both paths read the same extraction and the same
+eigenbasis (eigenvectors of a degenerate spectrum are defined only up to a rotation, so two
+solves of one problem differ). Prints ``PARITY IDENTICAL`` when every loss of every
+iteration and the parameter checksum agree exactly, else the largest relative difference.
+"""
 import json, os, sys, time
+
+deck, work, path, n_iter, base_path = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-sys.path.insert(0, "/home/enosmath/PERD/gNN")
-from modules import bootstrap
+os.environ.setdefault("JAX_ENABLE_COMPILATION_CACHE", "false")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from modules import autopilot, bootstrap
+from modules.autopilot import Budget
 bootstrap.setup_environment("selective_f64", True, platforms="cpu")
-# The research repo's prep cache pickles its classes as utils.<module>.<Class>;
+# The research repository's prep cache pickles its classes as utils.<module>.<Class>;
 # alias them so the SAME artifacts load into the extracted package.
 import importlib, types
 _alias = types.ModuleType("utils"); sys.modules["utils"] = _alias
@@ -13,38 +28,36 @@ for _m in ("ReservoirExtractors", "ReservoirMesh"):
     sys.modules[f"utils.{_m}"] = importlib.import_module(f"modules.utils.{_m}")
     setattr(_alias, _m, sys.modules[f"utils.{_m}"])
 import numpy as np
-from modules import pipeline, training
-from modules.config import *
+from modules import casedata, inference, pipeline, training
 
-cfg = RunConfig(
-    deck_path="/home/enosmath/Flintstone/gNNs/data/spe2-cartesian/equispaced/SPE-2-cartesian-equi.DATA",
-    work_dir=sys.argv[2],
-    input_encoding=InputEncoding.SPECTRAL, architecture=Architecture.DGM,
-    residual_design=ResidualDesign.SPECTRAL_PDE, backprop_design=BackpropDesign.FEM_NODAL,
-    stiffness_design=StiffnessDesign.PERM_WEIGHTED, sampling=SamplingDesign.WINDOW,
-    weighting=WeightingDesign.FIXED, special_opt=SpecialOpt.ENGD, special_opt_after=0,
-    parallelism=Parallelism.DATA, observation=ObservationDesign.BOTH, well_model=WellModel.CLOSED_FORM,
-    ctrl_switch="fb", pde_node_weight="well_gaussian", well_gauss_boost=4.0, well_gauss_width=1.0,
-    spectral_projection="galerkin", ic_design="penalty", rs_supervision="oil_only",
-    time_encoding="linear", tslice_layout="midpoint", well_encoding="logr",
-    n_eig=3, n_eig_z=0, m_width=0, n_blocks=0, n_iter=5, seed=30,
-    n_tslice=2, full_batch_cap=256,
-    spec=SpectralSettings(retention="deflation", stratify_components=False, min_comp_vol_frac=0.005,
-                          min_node_reuse=8, addressability_min=0.0, addressability_tol=0.01,
-                          blind_frac_max=0.0, n_eig_cap=63),
-    engd=EngdSettings(param_target=800, damping_rel=1e-4, damping_abs=0.0),
-    precision_policy="selective_f64", opt_f64=True,
-)
+budget = Budget(n_iter=n_iter)
 t0 = time.time()
-cfg, resolved, case, warns = pipeline.resolve_run(cfg)
-print("resolved", resolved.dim_in, resolved.param_count, cfg.n_eig, cfg.m_width, cfg.n_blocks, f"{time.time()-t0:.0f}s", flush=True)
-bundle = pipeline.build_pipeline(cfg, case=case, verbose=False)
-print("built", f"{time.time()-t0:.0f}s", flush=True)
+if path == "history":
+    cfg = autopilot.history(deck, work, "parity", budget)
+    cfg, resolved, case, _ = pipeline.resolve_run(cfg)
+    bundle = pipeline.build_pipeline(cfg, case=case, verbose=False)
+else:
+    n = int(path.split(":")[1])
+    cfg = autopilot.forecast(deck, work, "parity", n, budget)
+    full = casedata.load_case(cfg)
+    cfg, resolved, _, _ = pipeline.resolve_run(cfg, case=full)
+    bundle, _ = inference.build_joint_bundle(cfg, full, verbose=False)
+print("built", cfg.n_eig, cfg.m_width, cfg.n_blocks, bundle.resolved.groups, f"{time.time()-t0:.0f}s", flush=True)
 state = training.init_trainer(bundle)
-result = training.train(bundle, state, n_iter=5, log_every=1, stop_on_eta_zero=False)
-out = {k: [float(x) for x in v] for k, v in state.hist.items() if k in ("iter", "total", "pde", "ic", "data", "well")}
-out["params_hash"] = str(sum(float(np.asarray(x).sum()) for x in __import__("jax").tree_util.tree_leaves(state.params)))
-json.dump(out, open(sys.argv[1], "w"), indent=1)
-base = json.load(open(sys.argv[3]))
-same = all(out[k] == base[k] for k in ("iter", "total", "pde", "ic", "data", "well")) and out["params_hash"] == base["params_hash"]
-print("PARITY", "IDENTICAL" if same else "DIFFERENT", json.dumps({k: out[k] for k in ("total",)}), f"{time.time()-t0:.0f}s")
+training.train(bundle, state, n_iter=n_iter, log_every=1, stop_on_eta_zero=False)
+keys = ("iter", "total", *bundle.resolved.groups)
+out = {k: [float(x) for x in state.hist[k]] for k in keys}
+out["groups"] = list(bundle.resolved.groups)
+out["params_sum"] = float(sum(float(np.asarray(x, np.float64).sum()) for x in __import__("jax").tree_util.tree_leaves(state.params)))
+base = json.load(open(base_path))
+same = out == base
+worst = 0.0
+if not same and out["groups"] == base["groups"]:
+    for k in (*keys, "params_sum"):
+        a, b = np.atleast_1d(np.asarray(out[k], np.float64)), np.atleast_1d(np.asarray(base[k], np.float64))
+        if a.shape == b.shape:
+            worst = max(worst, float(np.max(np.abs(a - b) / np.maximum(np.abs(b), 1e-300))))
+        else:
+            worst = float("inf")
+print("PARITY", "IDENTICAL" if same else f"DIFFERENT (largest relative difference {worst:.3e})",
+      json.dumps({"total": out["total"], "upstream": base["total"]}), f"{time.time()-t0:.0f}s")

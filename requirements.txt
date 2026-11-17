@@ -1,7 +1,11 @@
 # Runtime of the gNN workflow. The platform installs perd-worker[otel,page]
 # after this file, so the SDK's own pins (grpcio, protobuf) win any conflict.
-jax[cuda12]==0.10.0
-flax==0.12.7
+# The page needs perd-worker 0.9 (toolbar, tabs, editors, maps); a build that
+# installs an older SDK fails the publish's page check.
+# A T4 workstation: jax with its CUDA 12 plugin. On an Intel GPU install
+# jax[oneapi]==0.12.0.1 instead; on a CPU, plain jax.
+jax[cuda12]==0.12.0
+flax==0.12.12
 optax==0.2.8
 chex==0.1.92
 numpy
@@ -12,7 +16,7 @@ joblib
 rips==2026.6.1.1
 grpcio
 protobuf
-# OPM Flow, the reference simulator, as a wheel.
+# OPM Flow, the simulator, as a wheel: it runs the models and its parser checks them.
 opm-simulators==2026.4
 # The deck-table parser vendored under field/ needs these.
 anytree

@@ -1,12 +1,12 @@
 r"""
 Reservoir case loading (port of the notebook's data-provenance cell).
 
-Loads the prep-cache artifacts for the configured deck
+Loads the prep-cache artifacts for the configured :class:`~modules.config.MeshCase`
 and derives everything the pipeline consumes: hex-mesh geometry, the physical
 output ranges that anchor the network's sigmoid transforms, per-cell rock
 properties with their layered profiles, reference state tensors, and the
 no-flow boundary face list. Well controls and observations live in
-:mod:`pinnlab.wells` (the time-resolved well pack and forcing).
+:mod:`modules.wells` (the time-resolved well pack and forcing).
 
 The four network outputs are mapped to physical primaries through range
 anchors derived from the deck (SCAL/PVT/ROCK tables, reference states, BHP
@@ -187,8 +187,49 @@ class CaseData:
         return self.phz[idx]
 
 
+def twin_signs(n: int) -> onp.ndarray:
+    r"""The sign pattern :math:`(+1, -1, +1, \dots)` of a synthetic twin's prior offset over
+    the ``n`` components of one target."""
+    return onp.where(onp.arange(n) % 2 == 0, 1.0, -1.0)
+
+
+def twin_perm_multiplier(cfg: RunConfig, aci) -> onp.ndarray:
+    r"""
+    The ``(n_cells, 3)`` factor by which a synthetic twin's prior permeability differs from
+    the deck's,
+
+    .. math::
+
+        \mathbf k_{\mathrm{prior}} \;=\; \mathbf k_{\mathrm{deck}} \odot
+        \bigl(e^{\sigma o_\ell},\; e^{\sigma o_\ell},\; e^{\sigma (o_\ell + o_v)}\bigr),
+
+    all ones unless a permeability target is inverted with a nonzero ``inv.twin_offset``.
+
+    where:
+    - :math:`\sigma` (``inv.prior_sd``): the prior standard deviation of a log-multiplier; :math:`o` (``inv.twin_offset``) the prior's offset from the deck in those units.
+    - :math:`o_\ell = o\,s_\ell` (``layer_k``): the offset of grid layer :math:`\ell`, alternating in sign (:func:`twin_signs`), applied to all three components.
+    - :math:`o_v = o` (``kvkh``): the offset of the vertical permeability alone.
+    """
+    from .config import ConfigError, deck_dims
+
+    m = onp.ones((onp.asarray(aci).shape[0], 3))
+    o, sd = float(cfg.inv.twin_offset), float(cfg.inv.prior_sd)
+    if o == 0.0:
+        return m
+    if "logk" in cfg.invert:
+        raise ConfigError("inv.twin_offset with invert=('logk',...): a log-permeability twin's "
+                          "prior is not defined; use the layer or vertical multipliers")
+    if "layer_k" in cfg.invert:
+        dims = deck_dims(cfg)
+        nz = dims[2] if dims is not None else int(onp.asarray(aci)[:, 2].max()) + 1
+        m *= onp.exp(sd * o * twin_signs(nz))[onp.asarray(aci)[:, 2]][:, None]
+    if "kvkh" in cfg.invert:
+        m[:, 2] *= onp.exp(sd * o)
+    return m
+
+
 def load_case(cfg: RunConfig) -> CaseData:
-    """Load the prep cache for ``cfg.deck_path`` and derive the pipeline inputs."""
+    """Load the prep cache for ``cfg.mesh_case`` and derive the pipeline inputs."""
     import jax.numpy as jnp
 
     import modules.utils.blackoil_closures as bo
@@ -196,9 +237,19 @@ def load_case(cfg: RunConfig) -> CaseData:
     from modules.utils.ReservoirExtractors import derive_physical_output_ranges
     from modules.utils.ReservoirPrepCache import build_or_load_preprocessing_artifacts
 
+    from modules.utils.ReservoirExtractors import deck_pvto_undersaturated, deck_three_phase_oil_model
+    from modules.utils.unit_conversion import convert_blackoil_pack, detect_unit_system
+
     model_path, prep_cache = case_paths(cfg)
     art = build_or_load_preprocessing_artifacts(model_path, prep_cache, build_if_missing=False)
-    tables = bo.tables_to_jax(art.blackoil_tables)
+    # The three-phase oil model and the undersaturated live-oil branches are read from the
+    # deck itself, so a cache written before they were extracted still runs the simulator's
+    # fluid model.
+    deck_fluid = {"kro_model": deck_three_phase_oil_model(model_path)}
+    us = deck_pvto_undersaturated(model_path)
+    if us is not None:
+        deck_fluid.update(convert_blackoil_pack(us, detect_unit_system(model_path)))
+    tables = bo.tables_to_jax({**art.blackoil_tables, **deck_fluid})
 
     phys = derive_physical_output_ranges(
         art, p_pad=cfg.p_pad, p_margin_frac=cfg.p_margin,
@@ -211,7 +262,7 @@ def load_case(cfg: RunConfig) -> CaseData:
     centroids = onp.asarray(art.reservoir_mesh.cell_centroids, onp.float32)
     cell_len = onp.asarray(art.reservoir_mesh.cell_lengths, onp.float32)
     aci = onp.asarray(art.reservoir_mesh.active_cell_indices)
-    perms = onp.asarray(art.rock_payload.perms, onp.float64)
+    perms = onp.asarray(art.rock_payload.perms, onp.float64) * twin_perm_multiplier(cfg, aci)
     poro_cell = onp.asarray(art.rock_payload.poro, onp.float64)
     n_nodes, n_cells = verts.shape[0], hexes.shape[0]
 
@@ -264,7 +315,7 @@ def load_case(cfg: RunConfig) -> CaseData:
 
     bc_cell, bc_axis = _boundary_faces(centroids, cell_len, verts)
 
-    return CaseData(
+    case = CaseData(
         art=art, tables=tables, phys=phys,
         verts=verts, hexes=hexes, centroids=centroids, cell_len=cell_len, aci=aci,
         perms=perms, poro_cell=poro_cell, n_nodes=n_nodes, n_cells=n_cells,
@@ -278,6 +329,160 @@ def load_case(cfg: RunConfig) -> CaseData:
         bc_cell=bc_cell, bc_axis=bc_axis,
         c_f=float(FIELD_DARCY_COEFF), rb_ft3=float(RB_PER_FT3),
     )
+    return apply_monitoring(cfg, case)
+
+
+def apply_monitoring(cfg: RunConfig, case: CaseData) -> CaseData:
+    r"""
+    The cell-state observations of a monitoring program: pressure surveys at the perforated
+    cells and saturation snapshots of the whole reservoir, with measurement noise, in place of
+    the reference state of every cell at every report step.
+
+    .. math::
+
+        \mathcal O \;=\; \bigl\{(t_j, c, p_o) : j \in \mathcal J_s,\; c \in \mathcal C_w\bigr\}
+        \;\cup\; \bigl\{(t_j, c, S_w), (t_j, c, S_g) : j \in \mathcal J_n\bigr\},
+        \qquad
+        y_{jc}^{\mathrm{obs}} \;=\; y_{jc} + \epsilon_{jc},
+
+    and every channel outside :math:`\mathcal O` is recorded as missing (NaN), which the
+    cell-state misfit skips (:func:`modules.residuals.state_misfit`).
+
+    where:
+    - :math:`\mathcal J_s`: the survey steps, every ``mon_survey_every``-th report step after the first; :math:`\mathcal C_w` the perforated cells of every well — a pressure survey reads the formation pressure along the completions.
+    - :math:`\mathcal J_n`: the snapshot steps ``mon_snapshots`` — a saturation map of every cell, as a time-lapse survey would give.
+    - :math:`\epsilon_{jc}`: independent Gaussian noise of standard deviation ``mon_noise_p`` (psi) on pressures and ``mon_noise_s`` on saturations (seed ``mon_seed``); a noisy saturation is clipped to :math:`[0, 1]`.
+
+    Without a monitoring program the full reference states are kept, noise included when
+    set. The reference arrays themselves (``case.pres`` and the rest) are untouched: every
+    accuracy measure is still taken against the whole truth.
+    """
+    import jax.numpy as jnp
+
+    from .config import monitoring_active
+
+    if not monitoring_active(cfg) and cfg.mon_noise_p == 0.0 and cfg.mon_noise_s == 0.0:
+        return case
+    T, N = case.n_times, case.n_cells
+    y = onp.stack([case.pres, case.swat, case.sgas, case.rs], -1).astype(onp.float64)
+    if monitoring_active(cfg):
+        obs = onp.zeros((T, N, 4), bool)
+        if cfg.mon_survey_every > 0:
+            from .wells import _repack_steps
+
+            perf = onp.unique(onp.asarray(_repack_steps(case)["perf_cell_idx"], onp.int64))
+            steps = onp.arange(cfg.mon_survey_every, T, cfg.mon_survey_every)
+            obs[onp.ix_(steps, perf, [0])] = True
+        for t in cfg.mon_snapshots:
+            if int(t) >= T:
+                from .config import ConfigError
+
+                raise ConfigError(f"mon_snapshots: report step {t} beyond the {T} steps of the case")
+            obs[int(t), :, 1:3] = True
+    else:
+        obs = onp.ones((T, N, 4), bool)
+    rng = onp.random.default_rng(int(cfg.mon_seed))
+    noise = onp.zeros_like(y)
+    if cfg.mon_noise_p > 0.0:
+        noise[..., 0] = rng.normal(0.0, cfg.mon_noise_p, (T, N))
+    if cfg.mon_noise_s > 0.0:
+        noise[..., 1:3] = rng.normal(0.0, cfg.mon_noise_s, (T, N, 2))
+    y_obs = y + noise
+    y_obs[..., 1:3] = onp.clip(y_obs[..., 1:3], 0.0, 1.0)
+    y_obs = onp.where(obs, y_obs, onp.nan)
+    rows = onp.flatnonzero(obs.any(axis=-1).reshape(-1))
+    t_idx, c_idx = onp.divmod(rows, N)
+    return dataclasses.replace(
+        case, cell_idx_data=jnp.asarray(c_idx, jnp.int32),
+        time_data=jnp.asarray(onp.asarray(case.times)[t_idx], jnp.float32),
+        y_data=jnp.asarray(y_obs.reshape(-1, 4)[rows], jnp.float32))
+
+
+def split_case(case: CaseData, n: int, half: str, y_anchor=None) -> CaseData:
+    r"""
+    Restrict ``case`` to one half of the temporal train/test split.
+
+    With :math:`n_t` report steps and a split count :math:`n`, the halves are
+
+    .. math::
+
+        \mathcal{T}_{\mathrm{train}} = \{t_0, \dots, t_{n-1}\},
+        \qquad
+        \mathcal{T}_{\mathrm{test}}  = \{t_n, \dots, t_{n_t-1}\},
+
+    so ``n`` is a *count* of training steps: ``split_case(case, 100, "train")``
+    fits the first 100 report steps and leaves the remainder to inference.
+
+    where:
+    - :math:`n`: ``train_split_n``; ``0`` yields an empty training half and an inference window spanning the whole history, and ``-1`` is handled by the caller as "no split at all".
+    - :math:`\mathcal{T}_{\mathrm{train}}, \mathcal{T}_{\mathrm{test}}`: the report times each half may draw supervision and collocation points from.
+
+    Three invariants make the two halves interchangeable for one parameter set:
+
+    - ``t_end``, ``times`` and ``n_times`` are **unchanged**. The encoder normalizes
+      :math:`t \mapsto 2t/t_{\mathrm{end}} - 1`, so narrowing ``t_end`` would remap
+      every physical time and break parameter transfer between the halves; the well
+      pack likewise asserts ``T == case.n_times``.
+    - the window is carried by ``t_lo``/``t_hi`` alone, which
+      :meth:`CaseData.t_span` hands to every collocation draw.
+    - the supervised tensors are sliced to the half's rows, so the ``data`` group
+      cannot see the other half.
+
+    The test half is additionally anchored: ``t_ic`` moves to the split time and
+    ``y_ic`` becomes ``y_anchor`` (the trained network's state there). Without an
+    anchor the inference window is an under-determined boundary-value problem.
+    When ``n == 0`` there is no trained state to anchor on, so the deck's own
+    initial condition at :math:`t = 0` is kept — known data in any forecast.
+
+    The ``"joint"`` half is the single-stage history-match + forecast window: the
+    collocation span is the whole horizon :math:`[0, t_{\mathrm{end}}]`, the
+    observation span is :math:`[0, t_s]` (``t_obs_hi``), imposed schedules take
+    effect from :math:`t_s` (``t_sched``), the supervised rows are the history rows
+    ``[0, n)``, and the initial condition stays the deck's at :math:`t = 0` — one
+    continuous field, no split-time anchor.
+    """
+    import jax.numpy as jnp
+
+    if half not in ("train", "test", "joint"):
+        raise ValueError(f"half must be 'train', 'test' or 'joint', got {half!r}")
+    n = int(n)
+    if not 0 <= n < case.n_times:
+        raise ValueError(f"split count {n} outside [0, {case.n_times})")
+
+    times = onp.asarray(case.times)
+    if half == "train":
+        lo_i, hi_i = 0, n                                  # rows [0, n)
+        t_lo = 0.0
+        t_hi = float(times[n - 1]) if n > 0 else 0.0   # n == 0 -> empty [0, 0] window
+    elif half == "joint":
+        lo_i, hi_i = 0, n                                  # supervised rows: history only
+        t_lo = 0.0
+        t_hi = float(times[-1])
+    else:
+        lo_i, hi_i = n, case.n_times                       # rows [n, n_times)
+        t_lo = float(times[n - 1]) if n > 0 else 0.0
+        t_hi = float(times[-1])
+
+    # supervised cell-state rows are laid out time-major: n_times blocks of n_cells
+    keep = slice(lo_i * case.n_cells, hi_i * case.n_cells)
+    upd = dict(
+        cell_idx_data=case.cell_idx_data[keep],
+        time_data=case.time_data[keep],
+        y_data=case.y_data[keep],
+        t_lo=t_lo,
+        t_hi=t_hi,
+    )
+    if half == "test":
+        upd["infer_half"] = True
+        upd["t_ic"] = t_lo
+        upd["t_sched"] = t_lo
+        if n > 0 and y_anchor is not None:
+            upd["y_ic"] = jnp.asarray(y_anchor, jnp.float32)
+    elif half == "joint":
+        t_s = float(times[n - 1]) if n > 0 else 0.0
+        upd["t_obs_hi"] = t_s
+        upd["t_sched"] = t_s
+    return dataclasses.replace(case, **upd)
 
 
 def _boundary_faces(centroids: onp.ndarray, cell_len: onp.ndarray, verts: onp.ndarray, eps: float = 1.0):

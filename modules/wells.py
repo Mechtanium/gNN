@@ -3,7 +3,7 @@ Wells: the time-resolved observation pack, the interior forcing it induces,
 and the Peaceman bridge from network state to bottom-hole pressures and rates
 (Chen, Huan & Ma eq. 8.11 family).
 
-Two well models coexist, selected by :attr:`~pinnlab.config.RunConfig.well_model`.
+Two well models coexist, selected by :attr:`~modules.config.RunConfig.well_model`.
 
 **closed_form (forcing as data).** The realized per-well, per-phase surface rates
 drive the interior component balances as known stimulation,
@@ -56,24 +56,18 @@ surface-volume inflow of phase :math:`\alpha` is
     C_F\, \mathrm{WI}_p\, f_{\alpha}\!\left(S, p\right)\,
     \bigl(p_{wb,p} - p_{\alpha,p}\bigr),
     \qquad
-    p_{wb,p} = p_{bh} + \gamma_\alpha\,(z_{p} - z_{bh})
-
-with the Peaceman well index recomputed from the cached geometry
-
-.. math::
-
-    \mathrm{WI}_p
-    \;=\;
-    \frac{2\pi\, h_s \sqrt{\det K_\perp}}{\ln(r_e / r_w) + s}
+    p_{wb,p} = p_{bh} + \Delta p^{\mathrm{col}}_{p}
 
 where:
 - :math:`C_F`: the FIELD Darcy constant (mD·ft·psi/cP → rb/day).
-- :math:`f_\alpha = k_{r\alpha}/(\mu_\alpha B_\alpha)`: the phase mobility factor at the perforated cell (θ_m-aware through the effective tables); injecting perforations use the total mobility :math:`\lambda_t / B_c` so a dry-gas injector at :math:`S_g = 0` stays well-posed.
-- :math:`p_{\alpha,p}`: the phase pressure at the perforation cell; :math:`\gamma_\alpha (z_p - z_{bh})` the wellbore hydrostatic correction with the phase gravity gradient as the column proxy.
-- :math:`h_s, K_\perp, r_e, s`: perforated length, transverse permeability block, Peaceman equivalent radius, and skin from the prep-cache metadata (:math:`r_w` from the deck's ``COMPDAT`` diameter, or Eclipse's 1 ft default).
+- :math:`\mathrm{WI}_p = \mathrm{CF}_p / C_F`: the well index from the reference run's own connection transmissibility factor (:func:`_apply_simulator_records`) — the Peaceman factor with the deck's wellbore diameter, skin and net-to-gross. Without the run's records the deck's explicit factor, else the Peaceman geometry :math:`2\pi h_s \sqrt{\det K_\perp}/(\ln(r_e/r_w) + s)` (:func:`well_index`).
+- :math:`f_\alpha = k_{r\alpha}/(\mu_\alpha B_\alpha)`: the phase mobility factor at the perforated cell (θ_m-aware through the effective tables), with the deck's three-phase oil model and undersaturated live oil; injecting perforations use the total mobility :math:`\lambda_t / B_c` so a dry-gas injector at :math:`S_g = 0` stays well-posed.
+- :math:`p_{\alpha,p}`: the cell pressure driving phase :math:`\alpha` into the wellbore — the oil (cell) pressure for every phase, as in the simulator's inflow equation: capillary pressure acts inside the reservoir, not at the connection.
+- :math:`\Delta p^{\mathrm{col}}_p`: the weight of the wellbore column between the BHP datum and the perforation — one pressure per depth, set by the mixture flowing below it. Over the observation window it is the column the reference run recorded at each report step; beyond the window, and under imposed schedules, it holds its last observed value. Without the run's records it falls back to each phase's own gradient, :math:`\gamma_\alpha (z_p - z_{bh})`.
 - Sign convention: **injection-positive** (production channels are negated on ingest).
 
-Each (step, well) is classified by its *realized* control mode, mirroring the
+Each (step, well) is classified by its *realized* control mode — the control the
+reference run actually applied over the step, read from its records, mirroring the
 simulator's control switching:
 
 - **rate mode** (the schedule rate is met): :math:`p_{bh}` is eliminated in closed form by pinning the realized control-phase rate,
@@ -98,26 +92,28 @@ phase rates. The row set is deterministic and full-time: the gather indices
 come from the mode-resolved masks at construction, so the ``well`` and ``ctrl``
 groups ignore the sampling window — exactly what the ENGD rows contract needs.
 Observation rows are restricted to the case's observation window
-(:meth:`~pinnlab.casedata.CaseData.t_obs_span`), so a train/test split never
+(:meth:`~modules.casedata.CaseData.t_obs_span`), so a train/test split never
 lets a future observation into the objective.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import math
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as onp
 
-from .config import RunConfig, WellModel, case_label, well_pack_meta_path
+from .config import RunConfig, WellModel, case_label, case_paths, well_pack_meta_path
 from .casedata import CaseData
 
-# Fallback wellbore radius [ft] when a perforation carries no COMPDAT diameter.
-_R_W = 0.5      # Eclipse's COMPDAT default (1 ft diameter), for a cache that predates perf_r_w
+# Prep-cache Peaceman defaults (prepare_well_metadata signature).
+_R_W = 0.1
 
 # Relative shortfall of realized vs schedule control rate that flags the
 # BHP-limited mode (simulator control switching, detected from the data).
@@ -193,6 +189,9 @@ class WellPack:
     well_scale: tuple = (1.0, 1.0, 1.0, 1.0)   # (s_bhp, s_qo, s_qw, s_qg)
     synthesized: bool = False
     synth_reason: str = ""
+    # the simulator's own records (None where its restart file carries none)
+    binding_sim: onp.ndarray = None     # (T, n_wells) 1.0 where the simulator held a rate-scheduled well at its BHP
+    col_dp: onp.ndarray = None          # (T, n_perf) wellbore pressure at each perforation minus the BHP [psi]; NaN unrecorded
 
 
 def _repack_steps(case: CaseData) -> dict:
@@ -252,6 +251,196 @@ def well_index(seq: dict, c_f: float) -> onp.ndarray:
     cf = onp.asarray(seq.get("perf_cf", onp.full((n_perf,), onp.nan)), onp.float64)
     explicit = onp.isfinite(cf) & (cf > 0.0)
     return onp.where(explicit, cf / float(c_f), wi_geo)
+
+
+@functools.lru_cache(maxsize=8)
+def _read_records(path: str, mtime: float) -> dict:
+    from modules.utils.ecl_binary import well_records
+
+    return well_records(path)
+
+
+def simulator_well_records(model_path) -> dict | None:
+    """The reference run's own per-step well and connection records
+    (:func:`modules.utils.ecl_binary.well_records`), read from the unified restart file beside the
+    deck (``RESULTS/<STEM>.UNRST``), or ``None`` when the run left none."""
+    deck = Path(model_path)
+    for folder in (deck.parent / "RESULTS", deck.parent):
+        for stem in dict.fromkeys((deck.stem.upper(), deck.stem)):
+            f = folder / f"{stem}.UNRST"
+            if f.exists():
+                return _read_records(str(f), f.stat().st_mtime)
+    return None
+
+
+def _apply_simulator_records(pack: WellPack, case: CaseData, rec: dict) -> None:
+    r"""
+    Take the well controls, the connection factors and the wellbore column from the
+    reference run's own records (in place).
+
+    The restart file of the reference run states, at every report step and for every
+    well, the control the schedule requested, the control the simulator actually
+    applied over the step just ended, the targets and limits in force, and for every
+    connection its transmissibility factor and pressure. These replace quantities that
+    would otherwise be re-derived from the deck:
+
+    .. math::
+
+        \mathrm{WI}_p \;=\; \frac{\mathrm{CF}_p}{C_F},
+        \qquad
+        p_{wb,p}(t_j) \;=\; p_{bh}(t_j) + \Delta p^{\mathrm{col}}_p(t_j),
+        \qquad
+        \Delta p^{\mathrm{col}}_p(t_j) \;=\; p^{\mathrm{conn}}_p(t_j) - p_{bh}(t_j)
+
+    where:
+    - :math:`\mathrm{CF}_p`: the simulator's connection transmissibility factor of perforation :math:`p` (Peaceman with the deck's wellbore diameter, skin and net-to-gross), :math:`C_F` the FIELD Darcy constant, so :math:`\mathrm{WI}_p` is the well index in mD·ft.
+    - :math:`p^{\mathrm{conn}}_p(t_j)`: the wellbore pressure the simulator held at the connection, and :math:`\Delta p^{\mathrm{col}}_p` the weight of the flowing mixture between the BHP datum and the connection. The column is one pressure per depth — the mixture of every phase flowing below, as the simulator's well model computes it — so a gas-rich producer sits on a light column and an injector on a column of the injected phase.
+    - :math:`t_j`: a report time; the records at :math:`t_j` describe the step that ends there, the same convention as the summary rates observed at :math:`t_j`.
+
+    The observed BHP and rates are the run's own values at each report time (where the
+    summary export marks them observed), so an observation can never slip to a neighbouring
+    report step. A report step without well records (the initial one) takes the controls of
+    the next step, which were in force from that time on. A rate request on a step the
+    simulator ran at the BHP limit is flagged in ``binding_sim``; a request for a combined
+    or reservoir-volume rate, which pins no single phase, is treated as such a step, so the
+    BHP is fixed at its observation and every observed rate becomes a row.
+    """
+    from modules.utils import ecl_binary as eb
+
+    T, W = pack.n_times, pack.n_wells
+    t_rec = onp.asarray(rec["time"], onp.float64)
+    has_wells = (rec["wtype"] > 0).any(axis=1)
+    tol = 1e-6 * max(1.0, float(onp.abs(pack.times).max()))
+    rows = onp.full(T, -1)
+    for t, tt in enumerate(pack.times):
+        later = onp.flatnonzero(has_wells & (t_rec >= tt - tol))
+        if later.size:
+            rows[t] = later[0]
+    wmap = [rec["names"].index(n) if n in rec["names"] else -1 for n in pack.well_names]
+    rate_phase = {eb.CTL_ORAT: 0, eb.CTL_WRAT: 1, eb.CTL_GRAT: 2}
+    injector = (eb.TYPE_OIL_INJ, eb.TYPE_WAT_INJ, eb.TYPE_GAS_INJ)
+    inj_phase = {eb.TYPE_OIL_INJ: 0, eb.TYPE_WAT_INJ: 1, eb.TYPE_GAS_INJ: 2}
+
+    binding = onp.zeros((T, W))
+    for t in range(T):
+        j = rows[t]
+        if j < 0:
+            continue
+        for w, k in enumerate(wmap):
+            if k < 0:
+                continue
+            wt = int(rec["wtype"][j, k])
+            if wt == 0 or int(rec["status"][j, k]) != 1:
+                pack.active[t, w] = pack.is_rate[t, w] = pack.q_ctrl[t, w] = 0.0
+                pack.p_bh_ctrl[t, w] = 0.0
+                continue
+            sign = 1.0 if wt in injector else -1.0
+            req, act = int(rec["ctl_requested"][j, k]), int(rec["ctl_active"][j, k])
+            tg = rec["targets"][j, k]
+            pack.active[t, w] = 1.0
+            pack.p_bh_ctrl[t, w] = float(tg[6])
+            if req in rate_phase:
+                ph = rate_phase[req]
+                pack.is_rate[t, w] = 1.0
+                pack.ctrl_phase[t, w] = ph
+                pack.q_ctrl[t, w] = sign * float(tg[ph])
+                binding[t, w] = float(act == eb.CTL_BHP)
+            elif req == eb.CTL_BHP:
+                pack.is_rate[t, w] = pack.q_ctrl[t, w] = 0.0
+            else:
+                ph = inj_phase.get(wt, 0)
+                pack.is_rate[t, w] = 1.0
+                pack.ctrl_phase[t, w] = ph
+                pack.q_ctrl[t, w] = sign * abs(float(rec["rates"][j, k, ph]))
+                binding[t, w] = 1.0
+    pack.binding_sim = binding
+
+    # observations: the simulator's own BHP and rates exactly at each report time, where the
+    # summary export observed them (a summary's float32 time stamps and extra ministep entries
+    # can slip a lookup by one report step; the restart records sit on the report times)
+    for t, tt in enumerate(pack.times):
+        d = onp.abs(t_rec - tt)
+        j = int(onp.argmin(d))
+        if d[j] > tol or not has_wells[j]:
+            continue
+        for w, k in enumerate(wmap):
+            if k < 0 or int(rec["wtype"][j, k]) == 0:
+                continue
+            if pack.bhp_mask[t, w] > 0:
+                pack.bhp_obs[t, w] = float(rec["bhp"][j, k])
+            q = rec["rates"][j, k]                               # oil, water, gas; production > 0
+            vals = (max(q[0], 0.0), max(q[1], 0.0), max(q[2], 0.0), max(-q[1], 0.0), max(-q[2], 0.0))
+            for c in range(5):
+                if pack.ch_mask[t, w, c] > 0:
+                    pack.ch_obs[t, w, c] = vals[c]
+
+    # connections: the factor, the datum and the column of every perforation of the pack
+    ijk = onp.asarray(case.art.reservoir_mesh.active_cell_indices)[pack.cell_idx] + 1
+    col = onp.full((T, pack.n_perf), onp.nan)
+    for p in range(pack.n_perf):
+        k = wmap[int(pack.well_id[p])]
+        if k < 0:
+            continue
+        cfs, datum = [], None
+        for t in range(T):
+            j = rows[t]
+            if j < 0:
+                continue
+            nc = int(rec["n_conn"][j, k])
+            hit = onp.flatnonzero((rec["conn_ijk"][j, k, :nc] == ijk[p]).all(axis=1))
+            if hit.size == 0:
+                continue
+            c = int(hit[0])
+            cfs.append(float(rec["conn_cf"][j, k, c]))
+            col[t, p] = float(rec["conn_p"][j, k, c] - rec["bhp"][j, k])
+            datum = float(rec["datum"][j, k])
+        if cfs:
+            pack.wi[p] = float(onp.median(cfs)) / float(case.c_f) * _prior_wi_ratio(case, int(pack.cell_idx[p]))
+            pack.z_bh[p] = datum
+            # a connection opened or closed mid-run keeps its nearest recorded column
+            known = onp.flatnonzero(onp.isfinite(col[:, p]))
+            nearest = known[onp.clip(onp.searchsorted(known, onp.arange(T)), 0, known.size - 1)]
+            prev = known[onp.clip(onp.searchsorted(known, onp.arange(T), side="right") - 1,
+                                  0, known.size - 1)]
+            col[:, p] = onp.where(prev <= onp.arange(T), col[prev, p], col[nearest, p])
+    pack.col_dp = col
+
+
+def _prior_wi_ratio(case: CaseData, cell: int) -> float:
+    r"""
+    The factor between the well index of the case's permeability and the simulator's
+    connection factor, which was computed on the deck's,
+
+    .. math::
+
+        \frac{\mathrm{WI}_{\mathrm{case}}}{\mathrm{WI}_{\mathrm{deck}}}
+        \;=\;
+        \sqrt{\frac{k_x k_y\big|_{\mathrm{case}}}{k_x k_y\big|_{\mathrm{deck}}}},
+
+    exact for Peaceman's index when the horizontal permeabilities change by a common factor
+    (the equivalent radius depends on their ratio only). It is one on an ordinary run and
+    carries a synthetic twin's prior permeability into the well index, so the truth's
+    connection factors never reach the prior model.
+
+    where :math:`k_x, k_y` are the horizontal permeabilities of the perforated cell.
+    """
+    k_case = onp.asarray(case.perms[cell], onp.float64)
+    k_deck = onp.asarray(case.art.rock_payload.perms, onp.float64)[cell]
+    return float(onp.sqrt(max(k_case[0] * k_case[1], 1e-300) / max(k_deck[0] * k_deck[1], 1e-300)))
+
+
+def _hold_column(pack: WellPack, keep: onp.ndarray) -> None:
+    """Replace the recorded column on the steps outside ``keep`` (a ``(T,)`` mask) by its
+    value at the last kept step: beyond what was observed, or under controls the
+    reference run never saw, the simulator's column is not known (in place)."""
+    if pack.col_dp is None:
+        return
+    keep = onp.asarray(keep, bool)
+    if keep.all():
+        return
+    last = onp.flatnonzero(keep)
+    held = pack.col_dp[last[-1]] if last.size else onp.full(pack.n_perf, onp.nan)
+    pack.col_dp = onp.where(keep[:, None], pack.col_dp, held[None, :])
 
 
 def _robust_scale(values: onp.ndarray, floor: float = 1.0) -> float:
@@ -315,7 +504,7 @@ def _window_masks(case: CaseData, times: onp.ndarray) -> tuple[onp.ndarray, onp.
     return t_obs, t_ctrl
 
 
-def build_well_pack(cfg: RunConfig, case: CaseData) -> WellPack:
+def build_well_pack(cfg: RunConfig, case: CaseData, *, write_meta: bool = True) -> WellPack:
     """
     Assemble the time-major well pack for one case and write the
     ``well_pack_meta.json`` row-count sidecar (consumed by the ENGD memory plan).
@@ -328,7 +517,8 @@ def build_well_pack(cfg: RunConfig, case: CaseData) -> WellPack:
     carries no usable rows;
     ``"synthetic"`` forces the synthesis path. Imposed ``cfg.inference.schedules``
     override the deck controls from ``case.t_sched`` onward (a split half or the
-    joint window sets it; an unsplit case never applies them).
+    joint window sets it; an unsplit case never applies them). ``write_meta=False`` leaves
+    the sidecar alone, for a pack built only to score a run (:func:`forecast_match_metrics`).
     """
     seq = _repack_steps(case)
     n_perf, n_wells = int(seq["n_perf"]), int(seq["n_wells"])
@@ -390,12 +580,21 @@ def build_well_pack(cfg: RunConfig, case: CaseData) -> WellPack:
         bhp_obs=bhp_obs, bhp_mask=onp.isfinite(bhp_obs).astype(onp.float64) * active,
         ch_obs=onp.nan_to_num(ch_obs), ch_mask=ch_mask,
         t_obs_mask=t_obs, t_ctrl_mask=t_ctrl,
-        well_model=str(cfg.well_model.value),
+        well_model=str(cfg.well_model.value), ctrl_switch=str(cfg.ctrl_switch),
     )
+    model_path = case_paths(cfg)[0]
+    rec = simulator_well_records(model_path)
+    if rec is not None:
+        from modules.utils.unit_conversion import convert_well_records, detect_unit_system
+
+        _apply_simulator_records(pack, case, convert_well_records(rec, detect_unit_system(model_path)))
+    _apply_monitoring(pack, cfg)
     _resolve_control_modes(pack)
 
     reason = ""
-    if int(pack.bhp_mask.sum() + pack.ch_mask.sum()) == 0:
+    if cfg.well_source == "synthetic":
+        reason = "well_source='synthetic' requested"
+    elif int(pack.bhp_mask.sum() + pack.ch_mask.sum()) == 0:
         reason = "the summary export carries no usable observation rows"
     if reason:
         synthesize_observations(case, pack, cfg)
@@ -406,6 +605,13 @@ def build_well_pack(cfg: RunConfig, case: CaseData) -> WellPack:
             f"closure — inverse-crime bridge, not field data: {reason}",
             RuntimeWarning, stacklevel=2)
 
+    # Imposed schedules must land BEFORE build_forcing and make_residuals: the interior
+    # source Q(t) is captured by closure at build time, so a later patch would change the
+    # reported controls while the PDE kept solving against the deck's own rates.
+    t_sched = float(getattr(case, "t_sched", -1.0))
+    if cfg.inference.schedules and t_sched >= 0.0:
+        apply_schedules(pack, cfg.inference.schedules, t_from=t_sched, case=case)
+
     _finalize_rows_and_scales(pack, case)
     meta = {"case": case_label(cfg), "n_perf": pack.n_perf, "n_wells": pack.n_wells,
             "n_times": pack.n_times, "n_rows": pack.n_rows,
@@ -413,12 +619,39 @@ def build_well_pack(cfg: RunConfig, case: CaseData) -> WellPack:
             "well_model": pack.well_model,
             "synthesized": bool(pack.synthesized)}
     path = well_pack_meta_path(cfg)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(meta, indent=1))
-    except OSError as e:  # noqa: PERF203 - sidecar is best-effort
-        print(f"[wells] sidecar not written ({e})")
+    if write_meta:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(meta, indent=1))
+        except OSError as e:  # noqa: PERF203 - sidecar is best-effort
+            print(f"[wells] sidecar not written ({e})")
     return pack
+
+
+def _apply_monitoring(pack: WellPack, cfg: RunConfig) -> None:
+    r"""
+    The well observations of the monitoring program (in place): without ``mon_bhp`` the
+    flowing BHP is not observed, and observed values carry Gaussian noise,
+
+    .. math::
+
+        p_{bh}^{\mathrm{obs}} = p_{bh} + \epsilon_p,
+        \qquad
+        q^{\mathrm{obs}} = q\,(1 + \epsilon_q),
+
+    where :math:`\epsilon_p \sim \mathcal N(0, \sigma_p^2)` (``mon_noise_p``, psi) and
+    :math:`\epsilon_q \sim \mathcal N(0, \sigma_q^2)` (``mon_noise_q``, relative), drawn
+    with seed ``mon_seed + 1``. An unobserved BHP also leaves the realized control mode
+    unknown (:func:`_resolve_control_modes` flags a BHP-limited step only where a BHP was
+    observed), as it would be in the field.
+    """
+    if not cfg.mon_bhp:
+        pack.bhp_mask = onp.zeros_like(pack.bhp_mask)
+    rng = onp.random.default_rng(int(cfg.mon_seed) + 1)
+    if cfg.mon_noise_p > 0.0:
+        pack.bhp_obs = pack.bhp_obs + rng.normal(0.0, cfg.mon_noise_p, pack.bhp_obs.shape) * (pack.bhp_mask > 0)
+    if cfg.mon_noise_q > 0.0:
+        pack.ch_obs = pack.ch_obs * (1.0 + rng.normal(0.0, cfg.mon_noise_q, pack.ch_obs.shape) * (pack.ch_mask > 0))
 
 
 def _resolve_control_modes(pack: WellPack) -> None:
@@ -436,6 +669,10 @@ def _resolve_control_modes(pack: WellPack) -> None:
 
     where:
     - :math:`\varepsilon_b`: the shortfall tolerance (:data:`_BIND_TOL`); the flag additionally requires an observed BHP to pin :math:`p_{bh}` to.
+
+    Where the reference run's records are available the flag is the run's own applied
+    control instead (``binding_sim``, :func:`_apply_simulator_records`): a rate request the
+    simulator held at its BHP limit, again only where that BHP was observed.
 
     Row selections: under ``closed_form`` the BHP row exists only where the closed
     form *predicts* :math:`p_{bh}` (rate mode); under ``predicted`` every observed
@@ -466,10 +703,13 @@ def _resolve_control_modes(pack: WellPack) -> None:
             binding,
             (sel & bhp_ok
              & (onp.abs(q_real) < (1.0 - _BIND_TOL) * onp.abs(pack.q_ctrl))).astype(onp.float64))
+    if pack.binding_sim is not None:
+        # the control the simulator actually applied, where an observed BHP can be held
+        binding = pack.binding_sim * bhp_ok
     pack.q_pin = q_pin
     pack.binding = binding
 
-    if False:
+    if pack.well_model == WellModel.PREDICTED.value:
         pack.bhp_row_mask = pack.bhp_mask * pack.active
     else:
         pack.bhp_row_mask = pack.bhp_mask * pack.is_rate * pack.active * (1.0 - binding)
@@ -529,11 +769,12 @@ def _finalize_rows_and_scales(pack: WellPack, case: CaseData | None = None) -> N
     # so neither head can read the simulator's future switching off the data
     pack.binding = pack.binding * t_obs
     pack.q_pin = onp.where(t_obs > 0, pack.q_pin, pack.q_ctrl)
+    _hold_column(pack, pack.t_obs_mask > 0)
 
     T, W = pack.n_times, pack.n_wells
     zeros = onp.zeros((T, W))
     pack.ctrl_rate_mask, pack.ctrl_bhp_mask, pack.ctrl_limit_mask = zeros, zeros.copy(), zeros.copy()
-    if False:   # the predicted-well control rows never exist for the closed form
+    if pack.well_model == WellModel.PREDICTED.value:
         has_bhp_obs = pack.bhp_row_mask > 0
         ctrl_ch_obs = onp.zeros((T, W), bool)
         for c, (ph, sign) in enumerate(zip(_CH_PHASE, _CH_SIGN)):
@@ -543,7 +784,7 @@ def _finalize_rows_and_scales(pack: WellPack, case: CaseData | None = None) -> N
         rate_steps = (pack.is_rate > 0) & (pack.active > 0) & (t_ctrl > 0)
         limit = rate_steps & (pack.p_bh_ctrl > 0) & ~has_bhp_obs
         rate = rate_steps & (pack.binding < 0.5) & ~ctrl_ch_obs
-        if pack.ctrl_switch == "fb":
+        if pack.ctrl_switch in ("fb", "staircase"):
             rate = rate & ~limit
         bhp = (pack.is_rate <= 0) & (pack.active > 0) & (pack.p_bh_ctrl > 0) & (t_ctrl > 0) & ~has_bhp_obs
         pack.ctrl_rate_mask = rate.astype(onp.float64)
@@ -577,7 +818,7 @@ def _finalize_rows_and_scales(pack: WellPack, case: CaseData | None = None) -> N
     pack.n_rows_well = n_bhp + n_rate
     pack.n_rows = pack.n_rows_well
     pack.n_rows_ctrl = int(pack.ctrl_rate_mask.sum() + pack.ctrl_bhp_mask.sum()
-                           + pack.ctrl_limit_mask.sum())
+                           + (2 if pack.ctrl_switch == "staircase" else 1) * pack.ctrl_limit_mask.sum())
 
     bhp = onp.where(pack.bhp_mask > 0, pack.bhp_obs, onp.nan)
     s_bhp = _robust_scale(bhp, floor=1.0)
@@ -632,6 +873,89 @@ def _interp_rows(times, table, t):
     i = jnp.clip(jnp.searchsorted(ts, t, side="right") - 1, 0, ts.shape[0] - 2)
     w = (t - ts[i]) / jnp.maximum(ts[i + 1] - ts[i], 1e-12)
     return (1.0 - w) * table[i] + w * table[i + 1]
+
+
+def _nearest_row(times, table, t):
+    """The report-step row whose interval contains ``t`` (piecewise-constant flags)."""
+    import jax.numpy as jnp
+
+    ts = times
+    t = jnp.clip(jnp.asarray(t, ts.dtype), ts[0], ts[-1])
+    i = jnp.clip(jnp.searchsorted(ts, t, side="right") - 1, 0, ts.shape[0] - 1)
+    return table[i]
+
+
+@dataclass
+class WellHead:
+    r"""
+    The trainable flowing-pressure head of the ``predicted`` well model.
+
+    .. math::
+
+        p_{wf,w}(t_j) \;=\; P_{\min} + (P_{\max} - P_{\min})\,\sigma(\eta_{wj}),
+        \qquad
+        p_{wf,w}(t) \;=\; (1 - \varsigma)\,p_{wf,w}(t_j) + \varsigma\,p_{wf,w}(t_{j+1}),
+        \quad \varsigma = \frac{t - t_j}{t_{j+1} - t_j}
+
+    where:
+    - :math:`\eta_{wj}`: the raw parameters, ``params["well"]["pwf_raw"]`` of shape ``(T, n_wells)``.
+    - :math:`P_{\min}, P_{\max}`: here the head's own range ``pack.pwf_range`` — the case's pressure anchors widened to enclose every observed or controlled BHP (:func:`_head_range`) — so :math:`p_{wf}` can never leave a physical range whatever :math:`\eta` does (the same hard-constraint device as the network's primaries).
+    - :math:`\varsigma`: the linear interpolation weight between the report times bracketing :math:`t`, so the head is continuous in time wherever the residual samples it.
+    """
+
+    times: Any                    # (T,) f32
+    p_min: float
+    p_max: float
+    raw0: onp.ndarray             # (T, n_wells) initial raw parameters
+
+    @classmethod
+    def from_pack(cls, pack: WellPack, case: CaseData) -> "WellHead":
+        import jax.numpy as jnp
+
+        p_min, p_max = pack.pwf_range
+        u = (onp.asarray(pack.pwf0, onp.float64) - p_min) / max(p_max - p_min, 1e-12)
+        u = onp.clip(u, _HEAD_EPS, 1.0 - _HEAD_EPS)
+        raw0 = onp.log(u / (1.0 - u)).astype(onp.float32)
+        return cls(times=jnp.asarray(pack.times, jnp.float32), p_min=p_min, p_max=p_max, raw0=raw0)
+
+    def params0(self) -> dict:
+        import jax.numpy as jnp
+
+        return {"pwf_raw": jnp.asarray(self.raw0, jnp.float32)}
+
+    def pwf(self, well_params) -> Any:
+        """(T, n_wells) flowing pressures [psia] at the report times."""
+        import jax
+
+        raw = well_params["pwf_raw"]
+        return self.p_min + (self.p_max - self.p_min) * jax.nn.sigmoid(raw)
+
+    def pwf_at(self, well_params, t) -> Any:
+        """(n_wells,) flowing pressures [psia] at time ``t`` (linear interpolation)."""
+        import jax.numpy as jnp
+
+        table = self.pwf(well_params)
+        return _interp_rows(jnp.asarray(self.times, table.dtype), table, t)
+
+
+def wrap_model_with_head(mb, head: WellHead):
+    """
+    Extend a :class:`~modules.models.ModelBundle` with the :math:`p_{wf}` head.
+
+    ``params0`` becomes ``{"net": ..., ["phys": ...,] "well": {"pwf_raw": ...}}`` and
+    ``apply`` routes features through the ``net`` block; composes with
+    :func:`modules.inversion.wrap_model` in either order. ``raw_apply`` /
+    ``raw_params0`` stay untouched so the bit-parity gate is unaffected.
+    """
+    params0 = mb.params0
+    if isinstance(params0, dict) and "net" in params0:
+        params0 = dict(params0)
+        params0["well"] = head.params0()
+        return dataclasses.replace(mb, params0=params0)
+    base_apply = mb.apply
+    params0 = {"net": mb.params0, "well": head.params0()}
+    return dataclasses.replace(
+        mb, params0=params0, apply=lambda p, feat: base_apply(p["net"], feat))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -696,6 +1020,25 @@ class WellForcing:
         return g @ self.rate_perf_at(t, params)                      # (3,)
 
 
+@dataclass
+class PredictedForcing(WellForcing):
+    r"""
+    The ``predicted`` well model's interior source: the same Gaussian nodal
+    partition and mollified density as :class:`WellForcing`, but the
+    per-perforation rates are the Peaceman prediction
+    :math:`q_{\alpha,p}(\theta, t)` of the :math:`p_{wf}` head (``rates_at``),
+    so the source moves with the parameters. ``q_perf`` is unused.
+    """
+
+    rates_at: Callable | None = None      # (params, t) -> (n_perf, 3) residual order (w, o, g)
+    predicted: bool = True
+
+    def rate_perf_at(self, t, params=None):
+        if params is None:
+            raise ValueError("PredictedForcing needs the parameters: rate_perf_at(t, params)")
+        return self.rates_at(params, t)
+
+
 def build_forcing(pack: WellPack, case: CaseData, from_controls: bool = False,
                   controls_from: float | None = None) -> WellForcing:
     r"""Assemble the :class:`WellForcing` series from the pack's realized rates.
@@ -710,7 +1053,7 @@ def build_forcing(pack: WellPack, case: CaseData, from_controls: bool = False,
     **controls alone**. On a forecast window the observed channels are the
     simulator's future output — using them would both leak the answer into the
     interior source and pin the source to the deck's history, so an imposed
-    :class:`~pinnlab.config.FlowSchedule` could never change the solution. A
+    :class:`~modules.config.FlowSchedule` could never change the solution. A
     control, by contrast, is an input the operator sets, so it is legitimately
     known ahead of time. Wells under BHP control contribute no source term in
     this mode: their rate is an *output* of the Peaceman closure, not something
@@ -780,18 +1123,24 @@ def build_forcing(pack: WellPack, case: CaseData, from_controls: bool = False,
 # ---------------------------------------------------------------------------------------------
 
 def _perf_state(P4, pack: WellPack, case: CaseData, tables, kr_floor: float,
-                wi_mult=None, is_inj=None, inj_phase=None):
+                wi_mult=None, is_inj=None, inj_phase=None, col_dp=None):
     r"""
     Everything the closure needs at the perforations, from the primaries.
 
     ``P4`` is ``(..., n_perf, 4)`` — :math:`(p_o, S_w, S_g, R_s)` at every perforated
-    cell for one or many times. Returns ``(f_eff, gam, p_ph, wi, dz, rs, f_floor)`` in the
+    cell for one or many times. Returns ``(f_eff, dp_wb, p_ph, wi, rs, f_floor)`` in the
     canonical phase order ``(o, w, g)``: the effective mobility factor (total
     mobility on injecting perforations; **unfloored**, so an immobile phase carries no
-    flow), the phase gravity gradients [psi/ft], the phase pressures, the (multiplied)
-    well indices, the datum offsets, :math:`R_s`, and the mobility increment
+    flow), the wellbore pressure at each perforation relative to the BHP [psi], the phase
+    pressures, the (multiplied) well indices, :math:`R_s`, and the mobility increment
     :math:`k_{r,\mathrm{floor}} / (\mu_\alpha B_\alpha)` the closed form adds to the
-    control phase of its denominator only. ``is_inj`` is the ``(..., n_perf)`` injector flag and ``inj_phase``
+    control phase of its denominator only.
+
+    The wellbore offset is the simulator's recorded column :math:`\Delta p^{\mathrm{col}}_p`
+    (:func:`_apply_simulator_records`) wherever it recorded the connection — ``col_dp``,
+    or the pack's own table when ``P4`` is stacked over its report times — and otherwise
+    the phase's own gradient over the datum offset,
+    :math:`\gamma_{\alpha,p}(z_p - z_{bh})`. ``is_inj`` is the ``(..., n_perf)`` injector flag and ``inj_phase``
     the ``(..., n_perf)`` injected phase; ``None`` reads the pack's resolved
     report-time arrays. An injecting perforation carries the total mobility on its
     injected phase **only** — the other legs are closed, so a gas injector cannot
@@ -813,11 +1162,14 @@ def _perf_state(P4, pack: WellPack, case: CaseData, tables, kr_floor: float,
         wi = wi * wi_mult.astype(dt)
     wid = jnp.asarray(pack.well_id, jnp.int32)
     dz = jnp.asarray(pack.z_cell - pack.z_bh, dt)                    # (n_perf,)
+    if (col_dp is None and pack.col_dp is not None and P4.ndim == 3
+            and P4.shape[0] == pack.col_dp.shape[0]):
+        col_dp = pack.col_dp
 
     p_o, s_w, s_g, rs = P4[..., 0], P4[..., 1], P4[..., 2], P4[..., 3]
     p_w = p_o - cap_pres_ow(s_w, tables)
     p_g = p_o + cap_pres_go(s_g, tables)
-    b_o, mu_o = fvf_oil(rs, tables), visc_oil(rs, tables)
+    b_o, mu_o = fvf_oil(rs, tables, p_o), visc_oil(rs, tables, p_o)
     b_w, mu_w = fvf_water(p_w, tables), visc_water(p_w, tables)
     b_g, mu_g = fvf_gas(p_g, tables), visc_gas(p_g, tables)
     # The mobilities that flow are UNFLOORED: an immobile phase (water at connate
@@ -840,7 +1192,14 @@ def _perf_state(P4, pack: WellPack, case: CaseData, tables, kr_floor: float,
     rho_w = case.dens_w / jnp.maximum(b_w, eps)
     rho_g = case.dens_g / jnp.maximum(b_g, eps)
     gam = grav * jnp.stack([rho_o, rho_w, rho_g], axis=-1)           # (..., n_perf, 3) psi/ft
-    p_ph = jnp.stack([p_o, p_w, p_g], axis=-1)
+    # every phase flows into the wellbore under the cell's (oil) pressure, as the simulator's
+    # inflow equation has it: capillary pressure acts inside the reservoir, not at the
+    # connection (each phase's PVT above is still read at its own phase pressure)
+    p_ph = jnp.stack([p_o, p_o, p_o], axis=-1)
+    dp_wb = gam * dz[:, None]                                        # (..., n_perf, 3)
+    if col_dp is not None:
+        col = jnp.asarray(col_dp, dt)
+        dp_wb = jnp.where(jnp.isnan(col)[..., None], dp_wb, jnp.nan_to_num(col)[..., None])
 
     if is_inj is None:
         is_inj = jnp.asarray(pack.is_inj, dt)[..., wid]              # (T, n_perf)
@@ -848,7 +1207,7 @@ def _perf_state(P4, pack: WellPack, case: CaseData, tables, kr_floor: float,
         inj_phase = jnp.asarray(pack.inj_phase, jnp.int32)[..., wid]
     onehot = jax.nn.one_hot(jnp.asarray(inj_phase, jnp.int32), 3, dtype=dt)
     f_eff = jnp.where(jnp.asarray(is_inj, dt)[..., None] > 0, f_inj * onehot, f)
-    return f_eff, gam, p_ph, wi, dz, rs, f_floor
+    return f_eff, dp_wb, p_ph, wi, rs, f_floor
 
 
 def closed_form_head(state, pack: WellPack, case: CaseData):
@@ -864,7 +1223,7 @@ def closed_form_head(state, pack: WellPack, case: CaseData):
     import jax.numpy as jnp
     from jax.ops import segment_sum
 
-    f_eff, gam, p_ph, wi, dz, rs, f_floor = state
+    f_eff, dp_wb, p_ph, wi, rs, f_floor = state
     dt = p_ph.dtype
     n_wells = pack.n_wells
     c_f = jnp.asarray(case.c_f, dt)
@@ -881,13 +1240,13 @@ def closed_form_head(state, pack: WellPack, case: CaseData):
     # control phase at initialization would otherwise send q_pin / den off to infinity)
     f_c = (jnp.take_along_axis(f_eff, ctrl_ph_perf[..., None], axis=-1)[..., 0]
            + jnp.take_along_axis(f_floor, ctrl_ph_perf[..., None], axis=-1)[..., 0])
-    gam_c = jnp.take_along_axis(gam, ctrl_ph_perf[..., None], axis=-1)[..., 0]
+    dp_c = jnp.take_along_axis(dp_wb, ctrl_ph_perf[..., None], axis=-1)[..., 0]
     p_c = jnp.take_along_axis(p_ph, ctrl_ph_perf[..., None], axis=-1)[..., 0]
 
     a_c = c_f * wi[None, :] * f_c                                    # (T, n_perf)
     seg = lambda x: segment_sum(x.T, wid, num_segments=n_wells).T    # (T, n_perf) -> (T, n_wells)
     den = jnp.maximum(seg(a_c), eps)
-    num = jnp.asarray(pack.q_pin, dt) + seg(a_c * (p_c - gam_c * dz[None, :]))
+    num = jnp.asarray(pack.q_pin, dt) + seg(a_c * (p_c - dp_c))
     # A near-immobile control phase (early training, kr ~ floor) sends Q/den to
     # astronomic pressures; clip to a generous physical range so the row stays
     # bounded (the IC/PDE groups restore mobility, un-railing the closed form).
@@ -910,7 +1269,7 @@ def closed_form_head(state, pack: WellPack, case: CaseData):
     # the control-phase rate reproduces q_pin exactly; every other phase keeps its unfloored
     # mobility and an immobile phase carries no phantom flow
     onehot_c = jax.nn.one_hot(ctrl_ph_perf, 3, dtype=dt)              # (T, n_perf, 3)
-    state_c = (f_eff + f_floor * onehot_c, gam, p_ph, wi, dz, rs, f_floor)
+    state_c = (f_eff + f_floor * onehot_c, dp_wb, p_ph, wi, rs, f_floor)
     q_hat, _ = predicted_head(state_c, p_bh_used, pack, case)
     return p_bh_hat, q_hat, p_bh_used
 
@@ -923,7 +1282,9 @@ def predicted_head(state, p_wf, pack: WellPack, case: CaseData, active=None):
     .. math::
 
         q_{\alpha,p} = C_F\, \mathrm{WI}_p\, f^{\mathrm{eff}}_{\alpha,p}\,
-        \bigl(p_{wf,w(p)} + \gamma_{\alpha,p}\Delta z_p - p_{\alpha,p}\bigr)
+        \bigl(p_{wf,w(p)} + \Delta p_{wb,p} - p_{\alpha,p}\bigr)
+
+    with :math:`\Delta p_{wb,p}` the wellbore offset of :func:`_perf_state`.
 
     ``p_wf`` has shape ``(..., n_wells)`` matching the leading axes of the state.
     Returns ``(q_hat, q_perf)``: the per-well totals ``(..., n_wells, 3)`` in
@@ -935,15 +1296,14 @@ def predicted_head(state, p_wf, pack: WellPack, case: CaseData, active=None):
     import jax.numpy as jnp
     from jax.ops import segment_sum
 
-    f_eff, gam, p_ph, wi, dz, rs, _f_floor = state
+    f_eff, dp_wb, p_ph, wi, rs, _f_floor = state
     dt = p_ph.dtype
     n_wells = pack.n_wells
     c_f = jnp.asarray(case.c_f, dt)
     wid = jnp.asarray(pack.well_id, jnp.int32)
 
     p_wf = jnp.asarray(p_wf, dt)
-    p_wb = p_wf[..., wid][..., None] + gam * dz[..., :, None] if p_wf.ndim > 1 else \
-        p_wf[wid][:, None] + gam * dz[:, None]
+    p_wb = (p_wf[..., wid] if p_wf.ndim > 1 else p_wf[wid])[..., None] + dp_wb
     q_perf = c_f * wi * f_eff.swapaxes(-1, -2)                        # (..., 3, n_perf)
     q_perf = q_perf.swapaxes(-1, -2) * (p_wb - p_ph)                  # (..., n_perf, 3)
     if active is not None:
@@ -980,6 +1340,63 @@ def _closure_core(P4, pack: WellPack, case: CaseData, tables, kr_floor: float, w
     return closed_form_head(state, pack, case)
 
 
+def fischer_burmeister(a, b, eps: float = FB_EPS):
+    r"""
+    Smoothed Fischer–Burmeister complementarity residual,
+
+    .. math::
+
+        \phi_\epsilon(a, b) \;=\; \sqrt{a^2 + b^2 + \epsilon^2} \;-\; a \;-\; b,
+
+    which vanishes (up to :math:`\epsilon`) exactly on the set
+    :math:`a \ge 0,\ b \ge 0,\ ab = 0`. For the well's control switch
+    :math:`a = \mathrm{sgn}_w (p_{wf} - p^{\mathrm{lim}}_{bh})/s_{bhp}` (the well may not
+    cross its BHP limit) and :math:`b = (|q^{\mathrm{ctrl}}| - |q_c(\theta)|)/s_{q_c}`
+    (it may not exceed its rate target): a well either meets its rate above the
+    limit or sits on the limit below its rate — the simulator's rule, in one
+    :math:`C^\infty` row with bounded derivatives.
+
+    where:
+    - :math:`\epsilon` (``eps``): the smoothing constant; :math:`\phi_0` is the exact (kinked) FB function.
+    """
+    import jax.numpy as jnp
+
+    return jnp.sqrt(a * a + b * b + eps * eps) - a - b
+
+
+def staircase_rows(a, q, q_max, eps: float = FB_EPS):
+    r"""
+    The two rows of the three-state control switch (``ctrl_switch="staircase"``): with the
+    pressure margin :math:`a = \mathrm{sgn}_w (p_{wf} - p^{\mathrm{lim}}_{bh})/s_{bhp}`, the
+    controlled rate :math:`q \ge 0` counted in the well's own direction (produced for a
+    producer, injected for an injector) and its target :math:`q_{\max}`, both in the rate
+    scale, the well obeys
+
+    .. math::
+
+        \phi_\epsilon\bigl(q_{\max} - q,\; a^{+}\bigr) = 0,
+        \qquad
+        \phi_\epsilon\bigl(q,\; a^{-}\bigr) = 0,
+        \qquad
+        a^{+} = \max(a, 0),\ a^{-} = \max(-a, 0)
+
+    where:
+
+    - :math:`\phi_\epsilon`: the smoothed Fischer–Burmeister function (:func:`fischer_burmeister`).
+    - the first row: above the limit (:math:`a > 0`) the rate is its target; the second: below
+      it (:math:`a < 0`) the rate is zero — the well is shut in; on the limit the rate lies
+      between. The single-row switch bounds only :math:`|q|` and so lets the rate change sign
+      where the field's pressure at the well falls below the limit.
+
+    Returns ``(up, down)``, arrays shaped like ``a``.
+    """
+    import jax.numpy as jnp
+
+    a_pos = jnp.maximum(a, 0.0)
+    a_neg = jnp.maximum(-a, 0.0)
+    return fischer_burmeister(q_max - q, a_pos, eps), fischer_burmeister(q, a_neg, eps)
+
+
 def synthesize_observations(case: CaseData, pack: WellPack, cfg: RunConfig) -> None:
     """Fill the pack's observation arrays from the reference cell states (in place).
 
@@ -992,7 +1409,7 @@ def synthesize_observations(case: CaseData, pack: WellPack, cfg: RunConfig) -> N
     ref = onp.stack([case.pres, case.swat, case.sgas, case.rs], axis=-1)   # (T, n_cells, 4)
     P4 = jnp.asarray(ref[:, pack.cell_idx, :], jnp.float64)
     p_bh_hat, q_hat, p_bh_used = _closure_core(P4, pack, case, case.tables,
-                                               kr_floor=float(cfg.kr_floor))
+                                               kr_floor=float(cfg.inv.kr_floor))
     p_bh = onp.asarray(p_bh_used)
     q = onp.asarray(q_hat)
 
@@ -1019,6 +1436,119 @@ _FIELD_UNITS_WARNED = False
 _FLOW_MODE_PHASE = {"ORAT": 0, "WRAT": 1, "GRAT": 2}
 
 
+def _schedule_to_field(sched):
+    r"""
+    One :class:`~modules.config.FlowSchedule` record as FIELD-unit ``(rate, bhp_limit)``.
+
+    Everything downstream of the prep cache is FIELD, so a METRIC record is rescaled
+    on ingest by the same factors the cache itself was normalized with:
+
+    .. math::
+
+        q_{\mathrm{FIELD}} = \gamma_q\, q_{\mathrm{METRIC}},
+        \qquad
+        p_{\mathrm{FIELD}} = \gamma_p\, p_{\mathrm{METRIC}}
+
+    where:
+    - :math:`\gamma_p = 14.5038`: bar :math:`\to` psia.
+    - :math:`\gamma_q`: :math:`6.2898` (sm³ :math:`\to` stb) for an ``ORAT``/``WRAT`` record, :math:`0.035315` (sm³ :math:`\to` Mscf) for ``GRAT``.
+
+    A record that leaves ``units`` unset is taken as FIELD and warned about once per
+    session; stating :attr:`~modules.config.FlowUnit.FIELD` explicitly silences it.
+    """
+    global _FIELD_UNITS_WARNED
+    from modules.utils.unit_conversion import BAR_TO_PSI, M3_TO_BBL, SM3_GAS_TO_MSCF
+
+    if sched.units is None:
+        if not _FIELD_UNITS_WARNED:
+            _FIELD_UNITS_WARNED = True
+            warnings.warn(
+                "FlowSchedule records do not declare `units`; their rate and bhp_limit are "
+                "read as FIELD (stb/day, Mscf/day, psia) to match every other cached "
+                "quantity. Set units=FlowUnit.FIELD to silence this, or FlowUnit.METRIC "
+                "to have sm3/day and bar converted for you.",
+                RuntimeWarning, stacklevel=2)
+        return float(sched.rate), float(sched.bhp_limit)
+    if str(sched.units.value).upper() == "METRIC":
+        g_q = SM3_GAS_TO_MSCF if sched.mode == "GRAT" else M3_TO_BBL
+        return float(sched.rate) * g_q, float(sched.bhp_limit) * BAR_TO_PSI
+    return float(sched.rate), float(sched.bhp_limit)
+
+
+def apply_schedules(pack: WellPack, schedules, t_from: float = 0.0, case: CaseData | None = None) -> WellPack:
+    r"""
+    Impose user :class:`~modules.config.FlowSchedule` records on a pack's controls,
+    in place, from ``t_from`` onward.
+
+    Each record takes effect at its own :math:`t_{\mathrm{start}}` and holds until the
+    next record for the same well, so for well :math:`w` the active record at time
+    :math:`t` is
+
+    .. math::
+
+        r_w(t) \;=\; \arg\max_{\,r \,\in\, R_w,\; t_{\mathrm{start}}(r) \,\le\, t}\; t_{\mathrm{start}}(r)
+
+    where:
+    - :math:`R_w`: the records naming well :math:`w`.
+    - :math:`t_{\mathrm{start}}(r)`: the record's activation time [days].
+    - :math:`t_{\mathrm{from}}`: the split time; report steps before it keep their deck controls untouched.
+
+    This is the deck's own step-function semantics, and it **overrides rather than
+    replaces**: a (well, step) pair no record covers keeps the controls the deck
+    resolved for it. Only the control arrays move; the observation arrays
+    (``bhp_obs``/``ch_obs`` and their masks) are left alone, because a forecast has
+    no observations — the residual-row masks are then re-derived from the new
+    controls by :func:`_resolve_control_modes`, exactly as
+    :func:`synthesize_observations` does for the inverse-crime bridge. A rate
+    record's ``bhp_limit`` lands in ``p_bh_ctrl`` and, under the ``predicted``
+    model, becomes the control-switch row of that step.
+    """
+    if not schedules:
+        return pack
+
+    names = {n: i for i, n in enumerate(pack.well_names)}
+    unknown = sorted({s.well for s in schedules if s.well not in names})
+    if unknown:
+        raise ValueError(f"FlowSchedule names unknown well(s) {unknown}; "
+                         f"the case carries {list(pack.well_names)}")
+
+    times = onp.asarray(pack.times, onp.float64)
+    span = times >= float(t_from)
+    if pack.binding_sim is not None:
+        pack.binding_sim = onp.where(span[:, None], 0.0, pack.binding_sim)
+    _hold_column(pack, ~span)
+    for w_name, w in names.items():
+        recs = sorted((s for s in schedules if s.well == w_name), key=lambda s: s.t_start)
+        if not recs:
+            continue
+        for k, rec in enumerate(recs):
+            t_hi = recs[k + 1].t_start if k + 1 < len(recs) else onp.inf
+            sel = span & (times >= rec.t_start) & (times < t_hi)
+            if not sel.any():
+                continue
+            rate, bhp = _schedule_to_field(rec)
+            if not rec.open_:                              # shut: no control, no forcing
+                pack.active[sel, w] = 0.0
+                pack.is_rate[sel, w] = 0.0
+                pack.q_ctrl[sel, w] = 0.0
+                pack.p_bh_ctrl[sel, w] = 0.0
+                continue
+            pack.active[sel, w] = 1.0
+            if rec.mode == "BHP":
+                pack.is_rate[sel, w] = 0.0
+                pack.q_ctrl[sel, w] = 0.0
+                pack.p_bh_ctrl[sel, w] = bhp
+            else:
+                pack.is_rate[sel, w] = 1.0
+                pack.q_ctrl[sel, w] = rate
+                pack.ctrl_phase[sel, w] = _FLOW_MODE_PHASE[rec.mode]
+                pack.p_bh_ctrl[sel, w] = bhp
+
+    _resolve_control_modes(pack)
+    _finalize_rows_and_scales(pack, case)
+    return pack
+
+
 # ---------------------------------------------------------------------------------------------
 # The residual builder
 # ---------------------------------------------------------------------------------------------
@@ -1036,7 +1566,7 @@ class WellOps:
 
 def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
                        centroids, eff_tables: Callable | None = None,
-                       wi_mult_of: Callable | None = None, head: Any | None = None) -> WellOps:
+                       wi_mult_of: Callable | None = None, head: WellHead | None = None) -> WellOps:
     r"""
     Build the well surfaces: ``well_arr(params) -> rows`` (scaled observation
     residual array for the ``well`` group), ``well_predict(params) -> (p_bh, q_hat)``
@@ -1053,12 +1583,16 @@ def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
     encoder = prim.encoder
     tables0 = case.tables
     eff = eff_tables if eff_tables is not None else (lambda params: tables0)
-    kr_floor = float(cfg.kr_floor)
+    kr_floor = float(cfg.inv.kr_floor)
+    predicted = pack.well_model == WellModel.PREDICTED.value
+    if predicted and head is None:
+        raise ValueError("well_model=predicted needs the WellHead (build it with WellHead.from_pack)")
 
     ci = jnp.asarray(pack.cell_idx, jnp.int32)
     enc_args = encoder.gather_args(ci)
     cxyz = centroids[ci]                                            # (n_perf, 3)
     times = jnp.asarray(pack.times, jnp.float32)
+    wid = jnp.asarray(pack.well_id, jnp.int32)
 
     # static row gathers from the mode-resolved masks
     bhp_sel = onp.nonzero(pack.bhp_row_mask.ravel() > 0)[0]
@@ -1075,11 +1609,11 @@ def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
     ch_sign_flat = jnp.asarray(ch_sign, jnp.float32)
 
     boost = None
-    if cfg.coning_boost > 0:
+    if cfg.inv.coning_boost > 0:
         # emphasize rows around observed rate transients (breakthrough fronts)
         dch = onp.abs(onp.diff(pack.ch_obs, axis=0, prepend=pack.ch_obs[:1]))
         dmax = onp.maximum(dch.max(axis=(0, 1), keepdims=True), 1e-12)
-        bw = 1.0 + cfg.coning_boost * (dch / dmax)
+        bw = 1.0 + cfg.inv.coning_boost * (dch / dmax)
         boost = jnp.asarray(onp.sqrt(
             onp.transpose(bw, (2, 0, 1)).reshape(5, -1).ravel()[ch_sel]), jnp.float32)
 
@@ -1102,19 +1636,222 @@ def make_well_residual(cfg: RunConfig, case: CaseData, pack: WellPack, prim,
             r_ch = r_ch * boost
         return r_ch
 
-    def _predict(params):
+    if not predicted:
+        def _predict(params):
+            P4 = _perf_primaries(params)
+            return _closure_core(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params))
+
+        def well_predict(params):
+            p_bh_hat, q_hat, p_bh_used = _predict(params)
+            return p_bh_used, q_hat
+
+        def well_arr(params):
+            p_bh_hat, q_hat, _ = _predict(params)
+            r_bhp = (p_bh_hat.reshape(-1)[bhp_sel] - bhp_obs_flat) / s_bhp
+            return jnp.concatenate([r_bhp, _ch_rows(q_hat)])
+
+        return WellOps(well_arr=well_arr, well_predict=well_predict)
+
+    # ---------------- predicted well model ------------------------------------------------
+    active = jnp.asarray(pack.active, jnp.float32)                   # (T, W)
+    is_inj_perf = jnp.asarray(pack.is_inj, jnp.float32)[:, wid]      # (T, n_perf)
+    inj_ph_perf = jnp.asarray(pack.inj_phase, jnp.int32)[:, wid]
+    rate_sel = onp.nonzero(pack.ctrl_rate_mask.ravel() > 0)[0]
+    bhp_c_sel = onp.nonzero(pack.ctrl_bhp_mask.ravel() > 0)[0]
+    lim_sel = onp.nonzero(pack.ctrl_limit_mask.ravel() > 0)[0]
+    ctrl_ph_flat = jnp.asarray(pack.ctrl_phase.ravel(), jnp.int32)
+    q_ctrl_flat = jnp.asarray(pack.q_ctrl.ravel(), jnp.float32)
+    p_lim_flat = jnp.asarray(pack.p_bh_ctrl.ravel(), jnp.float32)
+    s_q = jnp.asarray([s_qo, s_qw, s_qg], jnp.float32)
+    s_qc_flat = s_q[ctrl_ph_flat]
+    sgn_flat = jnp.where(q_ctrl_flat > 0, -1.0, 1.0).astype(jnp.float32)   # producers +1
+    hinge = cfg.ctrl_switch == "hinge"
+    staircase = cfg.ctrl_switch == "staircase"
+
+    def _state_T(params):
         P4 = _perf_primaries(params)
-        return _closure_core(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params))
+        return _perf_state(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params),
+                           is_inj=is_inj_perf.astype(P4.dtype), inj_phase=inj_ph_perf)
+
+    def _predict(params):
+        state = _state_T(params)
+        p_wf = head.pwf(params["well"]).astype(state[2].dtype)
+        q_hat, _ = predicted_head(state, p_wf, pack, case, active=active)
+        return p_wf, q_hat
 
     def well_predict(params):
-        p_bh_hat, q_hat, p_bh_used = _predict(params)
-        return p_bh_used, q_hat
+        return _predict(params)
 
     def well_arr(params):
-        p_bh_hat, q_hat, _ = _predict(params)
-        r_bhp = (p_bh_hat.reshape(-1)[bhp_sel] - bhp_obs_flat) / s_bhp
+        p_wf, q_hat = _predict(params)
+        r_bhp = (p_wf.reshape(-1)[bhp_sel] - bhp_obs_flat) / s_bhp
         return jnp.concatenate([r_bhp, _ch_rows(q_hat)])
 
-    return WellOps(well_arr=well_arr, well_predict=well_predict)
+    def ctrl_parts(params):
+        p_wf, q_hat = _predict(params)
+        p_flat = p_wf.reshape(-1)
+        q_c = jnp.take_along_axis(q_hat.reshape(-1, 3), ctrl_ph_flat[:, None], axis=1)[:, 0]
+        r_rate = (q_c - q_ctrl_flat) / s_qc_flat
+        r_bhp = (p_flat - p_lim_flat) / s_bhp
+        a = sgn_flat * (p_flat - p_lim_flat) / s_bhp
+        b = (jnp.abs(q_ctrl_flat) - jnp.abs(q_c)) / s_qc_flat
+        up, down = staircase_rows(a, -sgn_flat * q_c / s_qc_flat, jnp.abs(q_ctrl_flat) / s_qc_flat)
+        return {"rate": r_rate, "bhp": r_bhp, "a": a, "b": b,
+                "fb": fischer_burmeister(a, b), "hinge": jnp.maximum(0.0, -a), "up": up, "down": down}
+
+    def ctrl_arr(params):
+        parts = ctrl_parts(params)
+        rows = [parts["rate"][rate_sel], parts["bhp"][bhp_c_sel]]
+        if lim_sel.size:
+            if staircase:
+                rows.append(parts["up"][lim_sel])
+                rows.append(parts["down"][lim_sel])
+            else:
+                rows.append((parts["hinge"] if hinge else parts["fb"])[lim_sel])
+        return jnp.concatenate(rows)
+
+    # the interior source at an arbitrary collocation time
+    is_inj_tab = jnp.asarray(pack.is_inj, jnp.float32)
+    inj_ph_tab = jnp.asarray(pack.inj_phase, jnp.int32)
+    act_tab = active
+    col_tab = col_known = None
+    if pack.col_dp is not None:
+        col_tab = jnp.asarray(onp.nan_to_num(pack.col_dp), jnp.float32)
+        col_known = jnp.asarray(onp.isfinite(pack.col_dp).all(axis=0))
+
+    def rates_at(params, t):
+        t32 = jnp.asarray(t, jnp.float32)
+        xt = jnp.concatenate([cxyz, jnp.full((cxyz.shape[0], 1), t32, cxyz.dtype)], axis=1)
+        P4 = vmap(lambda x, *a: prim.primaries_point(params, x, *a))(xt, *enc_args)  # (n_perf, 4)
+        inj = _nearest_row(times, is_inj_tab, t32)[wid].astype(P4.dtype)
+        inj_ph = _nearest_row(times, inj_ph_tab, t32)[wid]
+        col_t = None
+        if col_tab is not None:
+            col_t = jnp.where(col_known, _interp_rows(times, col_tab, t32), jnp.nan)
+        state = _perf_state(P4, pack, case, eff(params), kr_floor, wi_mult=_wi_mult(params),
+                            is_inj=inj, inj_phase=inj_ph, col_dp=col_t)
+        p_wf = head.pwf_at(params["well"], t32).astype(P4.dtype)
+        act = _nearest_row(times, act_tab, t32).astype(P4.dtype)
+        _, q_perf = predicted_head(state, p_wf, pack, case, active=act)
+        return q_perf                                                 # (n_perf, 3) residual order
+
+    cent = onp.asarray(case.centroids)
+    cell_len = onp.asarray(case.cell_len)
+    forcing = PredictedForcing(
+        times=times, q_perf=None,
+        perf_xyz=jnp.asarray(cent[pack.cell_idx], jnp.float32),
+        perf_sigma=jnp.asarray(cell_len[pack.cell_idx], jnp.float32),
+        rates_at=rates_at)
+    return WellOps(well_arr=well_arr, well_predict=well_predict, ctrl_arr=ctrl_arr,
+                   forcing=forcing, ctrl_parts=ctrl_parts)
 
 
+def forecast_match_metrics(cfg: RunConfig, case: CaseData, p_bh_hat: onp.ndarray,
+                           q_hat: onp.ndarray, n: int) -> dict:
+    r"""
+    The observation-match RMSEs of :func:`well_match_metrics` over the forecast: the report
+    steps after a history of :math:`n`,
+
+    .. math::
+
+        \mathcal T_{\mathrm{fc}} \;=\; \{\, t_n, \dots, t_{n_t - 1} \,\},
+
+    scored against the simulator's records. The reference is the pack of the whole horizon
+    built without the monitoring program — its BHP observed, no noise — so a run matched on
+    noisy or partial data is judged against what the reservoir did, and its observation rows
+    are restricted to :math:`\mathcal T_{\mathrm{fc}}`. No row scored here entered a loss.
+    Returns ``test_well_bhp_rmse`` (psi) and ``test_well_rate_rmse`` (per channel scale), or
+    nothing when the run imposes schedules beyond the history, for which the simulator holds
+    no record.
+
+    where:
+    - :math:`n`: ``train_split_n``, the number of history report steps; :math:`n_t`: the number of report steps.
+    """
+    from dataclasses import replace
+
+    if cfg.inference.schedules or n >= int(case.n_times):
+        return {}
+    clean = replace(cfg, mon_bhp=True, mon_noise_p=0.0, mon_noise_q=0.0)
+    pack = build_well_pack(clean, replace(case, t_obs_hi=-1.0), write_meta=False)
+    fc = (onp.arange(pack.n_times) >= int(n)).astype(onp.float64)
+    pack.bhp_row_mask = pack.bhp_row_mask * fc[:, None]
+    pack.ch_row_mask = pack.ch_row_mask * fc[:, None, None]
+    m = well_match_metrics(pack, onp.asarray(p_bh_hat), onp.asarray(q_hat))
+    return {f"test_{k}": v for k, v in m.items() if k in ("well_bhp_rmse", "well_rate_rmse")}
+
+
+def well_match_metrics(pack: WellPack, p_bh_hat: onp.ndarray, q_hat: onp.ndarray,
+                       p_clip: tuple[float, float] | None = None,
+                       p_anchors: tuple[float, float] | None = None) -> dict:
+    """Row-masked observation-match RMSEs (BHP in psi, rates per channel scale), the
+    control-match RMSEs of the ``ctrl`` rows (predicted model), and the rail fraction:
+    under ``closed_form`` the share of rate-mode steps whose eliminated BHP sits on its
+    clip bound (``p_clip``), under ``predicted`` the share of active steps whose head
+    sits within ``_RAIL_TOL`` of the pressure anchors (``p_anchors``) — a railed head
+    is a well whose control the state cannot deliver, and its rows carry no gradient."""
+    out: dict = {}
+    m = pack.bhp_row_mask > 0
+    if m.any():
+        out["well_bhp_rmse"] = float(onp.sqrt(onp.mean((p_bh_hat[m] - pack.bhp_obs[m]) ** 2)))
+    s_bhp, s_qo, s_qw, s_qg = pack.well_scale
+    scale = onp.asarray([s_qo, s_qw, s_qg])
+    errs = []
+    for c, (ph, sign) in enumerate(zip(_CH_PHASE, _CH_SIGN)):
+        mc = pack.ch_row_mask[:, :, c] > 0
+        if mc.any():
+            errs.append((sign * q_hat[:, :, ph][mc] - pack.ch_obs[:, :, c][mc]) / scale[ph])
+    if errs:
+        e = onp.concatenate(errs)
+        out["well_rate_rmse"] = float(onp.sqrt(onp.mean(e ** 2)))
+    predicted = pack.well_model == WellModel.PREDICTED.value
+    if predicted:
+        q_c = onp.take_along_axis(q_hat, pack.ctrl_phase[:, :, None], axis=2)[:, :, 0]
+        mr = pack.ctrl_rate_mask > 0
+        if mr.any():
+            out["ctrl_rate_rmse"] = float(onp.sqrt(onp.mean(
+                ((q_c[mr] - pack.q_ctrl[mr]) / scale[pack.ctrl_phase[mr]]) ** 2)))
+        mb = pack.ctrl_bhp_mask > 0
+        if mb.any():
+            out["ctrl_bhp_rmse"] = float(onp.sqrt(onp.mean((p_bh_hat[mb] - pack.p_bh_ctrl[mb]) ** 2)))
+        ml = pack.ctrl_limit_mask > 0
+        if ml.any():
+            sgn = onp.where(pack.q_ctrl > 0, -1.0, 1.0)
+            a = sgn * (p_bh_hat - pack.p_bh_ctrl) / s_bhp
+            b = (onp.abs(pack.q_ctrl) - onp.abs(q_c)) / scale[pack.ctrl_phase]
+            out["ctrl_switch_frac"] = float((onp.abs(a[ml]) < onp.abs(b[ml])).mean())
+        if p_anchors is not None:
+            lo, hi = p_anchors
+            tol = _RAIL_TOL * (hi - lo)
+            act = pack.active > 0
+            if act.any():
+                railed = (p_bh_hat[act] <= lo + tol) | (p_bh_hat[act] >= hi - tol)
+                out["well_bhp_rail_frac"] = float(railed.mean())
+    elif p_clip is not None:
+        closed = (pack.is_rate * (1.0 - pack.binding)) > 0
+        if closed.any():
+            lo, hi = p_clip
+            tol = 1e-3 * (hi - lo)
+            railed = (p_bh_hat[closed] <= lo + tol) | (p_bh_hat[closed] >= hi - tol)
+            out["well_bhp_rail_frac"] = float(railed.mean())
+    return out
+
+
+def material_balance_obs(case: CaseData, pack: WellPack, n_probes: int):
+    """
+    Cumulative observed oil production at strided probe times (for the
+    material-balance penalty): ``(t_probe [days], q_cum [stb])``.
+
+    Uses the ``wopr`` channel where observed and falls back to the control rate
+    of oil-rate-controlled producers elsewhere.
+    """
+    wopr = onp.where(pack.ch_mask[:, :, 0] > 0, pack.ch_obs[:, :, 0], onp.nan)
+    ctrl = onp.where((pack.ctrl_phase == 0) & (pack.is_rate > 0) & (pack.q_ctrl < 0),
+                     -pack.q_ctrl, onp.nan)
+    rate = onp.where(onp.isfinite(wopr), wopr, ctrl)                 # (T, n_wells) production+
+    rate = onp.nan_to_num(rate).sum(axis=1)                          # (T,)
+    t = onp.asarray(pack.times, onp.float64)
+    dt = onp.diff(t, prepend=t[:1])
+    q_cum = onp.cumsum(0.5 * (rate + onp.roll(rate, 1)) * dt)
+    q_cum[0] = 0.0
+    idx = onp.unique(onp.linspace(1, len(t) - 1, num=min(n_probes, len(t) - 1)).astype(int))
+    return t[idx], q_cum[idx]

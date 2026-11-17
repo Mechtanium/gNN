@@ -42,7 +42,7 @@ The Cartesian encoding is the plain normalized-coordinate map
 where:
 - :math:`t_w` (``time_warp_days``): the warp scale — linear below it, logarithmic above it, so a report schedule that refines its steps geometrically toward :math:`t = 0` (the pressure transient of a well start-up: SPE2 writes a hundred steps inside the first day of a 900-day history) is spread over the channel instead of being folded into :math:`\Delta\tau \sim 10^{-3}` next to the initial condition, where the network would need a :math:`10^{4}`-fold steeper slope than anywhere else.
 - ``time_warp_days = 0``: :math:`t_w` is chosen from the case's report times as the scale that spreads the report steps most evenly in :math:`\tau` (:func:`resolve_time_warp`, the maximum geometric mean of :math:`\Delta\tau_i` over a log grid).
-- :math:`t(\tau)`: the inverse, used by the hard-IC ramp of :mod:`pinnlab.physics` to read the physical time back off the feature vector.
+- :math:`t(\tau)`: the inverse, used by the hard-IC ramp of :mod:`modules.physics` to read the physical time back off the feature vector.
 
 **Near-well channel** (``well_encoding="logr"``, spectral encoder only). The retained
 eigenmodes are global, smooth functions of position, so two cells a single width
@@ -64,14 +64,41 @@ where:
 - :math:`\mathbf{x}_p`: the perforated-cell centroids of every well of the case (:func:`perforation_xyz`), so the channel is the distance to the nearest well — one feature for any well count.
 - :math:`r_0` (``well_enc_r0_ft``): the inner cutoff, defaulting to half the smallest edge of the perforated cells — the scale below which the discrete field cannot resolve the cone anyway, and small enough that the thin layers above and below a completion (SPE2: 8-ft layers under a 164-ft areal cell) keep distinct channel values; :math:`r_{\max}`: the largest cell-centroid distance, so the channel spans :math:`[-1, 1]` over the mesh.
 - the gradient enters the affine per-cell map :math:`B_v` so the chain-rule residual differentiates through the channel like through any eigenfeature; nodal values feed the whole-mesh evaluator.
+
+**Depth channel** (``depth_encoding="z"``, spectral encoder only). The low modes of a
+layered reservoir vary slowly along a vertical column, so two cells stacked in one column
+can share every retained feature until deep in the spectrum — on a field-scale grid, cells
+one layer apart (a few tens of feet) can need hundreds of modes to tell apart. The encoder
+therefore appends the standardized depth itself,
+
+.. math::
+
+    \zeta(\mathbf{x}) \;=\; \frac{z - \bar z}{s_z},
+    \qquad
+    \nabla \zeta \;=\; \frac{1}{s_z}\,\hat{\mathbf{z}},
+    \qquad
+    \gamma(\mathbf{x}, t) \;=\; \bigl[\,v(\mathbf{x}),\; \zeta(\mathbf{x}),\; \phi_w(\mathbf{x}),\; \tau(t)\,\bigr]
+
+where:
+- :math:`\bar z, s_z`: the nodal mean and standard deviation of the vertical coordinate; :math:`\hat{\mathbf{z}}`: the vertical unit vector; the standardization the eigenmodes receive; the channel and its per-cell gradient come from :func:`modules.spectral.depth_features`, which the addressability gate reads too, so the floor is resolved for the input the network actually sees.
+- :math:`\phi_w`: the near-well channel, present only under ``well_encoding="logr"``; the order is eigenfeatures, depth, near-well, time.
+- the vertical node columns of the eigenbasis are a separate choice (``spec.column_grouping``, :func:`modules.spectral.column_ids`) that adds no channel.
+
+**Hard initial condition.** Under ``ic_design="hard"`` both encoders append the
+raw (logit-space) initial state :math:`y^0(x) \in \mathbb{R}^4` of the evaluation
+point to the feature vector; :func:`modules.physics.make_primaries` strips it off
+again and uses it as the offset of the ansatz :math:`y = y^0 + \beta(t)\,\mathcal{N}_\theta`.
+Carrying :math:`y^0` inside the feature vector keeps every evaluator and call site
+encoding-agnostic — the network itself still sees only the first ``dim_in`` entries.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+from .config import InputEncoding, RunConfig
 from .casedata import CaseData
-from .config import RunConfig
 from .spectral import SpectralBundle
 
 
@@ -129,6 +156,32 @@ def _t_of_tau(tau, t_end: float, t_warp):
     return t_warp * (jnp.expm1(0.5 * (tau + 1.0) * jnp.log1p(t_end / t_warp)))
 
 
+def base_cell(encoder, ci):
+    r"""
+    The mesh cell of a row's cell index: under a family of reservoirs a row is addressed by
+    the *virtual* cell :math:`c + n_{\mathrm{cells}}\, s` (cell :math:`c` of sample :math:`s`),
+    and every per-cell array of the mesh — the centroids above all — must be read at
+
+    .. math::
+
+        c \;=\; \tilde c \bmod n_{\mathrm{cells}}
+
+    where:
+
+    - :math:`\tilde c`: the row's (virtual) cell index; :math:`n_{\mathrm{cells}}`: the cells of
+      the mesh (``encoder.n_cells``);
+    - without a family (no ``m_table``) the index is the cell itself.
+
+    A gather with the virtual index itself would not fail — an out-of-range gather is clamped
+    to the last cell — but it would place every row of every sample but the first at the last
+    cell's coordinates.
+    """
+    m_table = getattr(encoder, "m_table", None)
+    if m_table is None:
+        return ci
+    return ci % int(encoder.n_cells)
+
+
 @dataclass
 class SpectralEncoder:
     """Δ-PINN positional encoding: standardized Laplace eigenfeatures + time."""
@@ -140,6 +193,78 @@ class SpectralEncoder:
     t_end: float
     dim_in: int
     needs_eigenbasis: bool = True
+    y0_cells: Any = None          # (n_cells, 4) raw IC offsets (hard IC) or None
+    y0_nodes: Any = None          # (n_nodes, 4)
+    t_warp: float | None = None   # log time channel scale [days]; None = linear
+    m_table: Any = None           # (n_samples, n_m) whitened properties of a family of reservoirs, or None
+    n_cells: int = 0              # cells per sample when ``m_table`` is set: point c + n_cells * s is cell c of sample s
+
+    def tau(self, t):
+        return _tau_of(t, self.t_end, self.t_warp)
+
+    def t_of_tau(self, tau):
+        return _t_of_tau(tau, self.t_end, self.t_warp)
+
+    def cell_arrays(self):
+        """The per-cell static arrays ``gather_args`` indexes (for samplers that gather by hand);
+        under a family the property channel is gathered by sample, not by cell."""
+        base = (self.v_c, self.b_v, self.centroids)
+        return base + ((self.y0_cells,) if self.y0_cells is not None else ())
+
+    def gather_args(self, cells):
+        if self.m_table is None:
+            return tuple(a[cells] for a in self.cell_arrays())
+        c, s = cells % self.n_cells, cells // self.n_cells
+        base = (self.v_c[c], self.b_v[c], self.centroids[c], self.m_table[s])
+        return base + ((self.y0_cells[c],) if self.y0_cells is not None else ())
+
+    def feat_xt(self, xt, vc, Bv, xc, *rest):
+        r"""
+        The feature vector of a point: the eigenfeatures (with the depth and near-well
+        channels) corrected to the point, the time channel, then — under a family — the
+        sample's whitened properties :math:`\mathbf m`, and under the hard initial condition
+        the raw IC offsets. ``rest`` holds the optional ``m`` and ``y0`` in that order, as
+        :meth:`gather_args` returns them.
+        """
+        import jax.numpy as jnp
+
+        v = vc + (xt[:3] - xc) @ Bv
+        parts = [v, jnp.reshape(self.tau(xt[3]), (1,))]
+        rest = list(rest)
+        if self.m_table is not None:
+            parts.append(jnp.asarray(rest.pop(0), v.dtype))
+        if rest and rest[0] is not None:
+            parts.append(jnp.asarray(rest[0], v.dtype))
+        return jnp.concatenate(parts)
+
+    def feat_nodes_t(self, t, m=None):
+        """Features of every mesh node at time ``t``; under a family ``m`` is the sample's
+        whitened properties, appended to every node."""
+        import jax.numpy as jnp
+
+        tn = self.tau(t)
+        col = jnp.full((self.v_nodes.shape[0], 1), tn, self.v_nodes.dtype)
+        parts = [self.v_nodes, col]
+        if self.m_table is not None:
+            mm = jnp.asarray(self.m_table[0] if m is None else m, self.v_nodes.dtype)   # the first sample by default
+            parts.append(jnp.broadcast_to(mm[None, :], (self.v_nodes.shape[0], mm.shape[0])))
+        if self.y0_nodes is not None:
+            parts.append(jnp.asarray(self.y0_nodes, self.v_nodes.dtype))
+        return jnp.concatenate(parts, axis=1)
+
+
+@dataclass
+class CartesianEncoder:
+    """Vanilla PINN positional encoding: bbox-normalized coordinates + time."""
+
+    lo: Any
+    hi: Any
+    node_xyz: Any
+    t_end: float
+    dim_in: int = 4
+    needs_eigenbasis: bool = False
+    y0_cells: Any = None          # (n_cells, 4) raw IC offsets (hard IC) or None
+    y0_nodes: Any = None          # (n_nodes, 4)
     t_warp: float | None = None   # log time channel scale [days]; None = linear
 
     def tau(self, t):
@@ -149,24 +274,76 @@ class SpectralEncoder:
         return _t_of_tau(tau, self.t_end, self.t_warp)
 
     def cell_arrays(self):
-        """The per-cell static arrays ``gather_args`` indexes (for samplers that gather by hand)."""
-        return (self.v_c, self.b_v, self.centroids)
+        return (self.y0_cells,) if self.y0_cells is not None else ()
 
     def gather_args(self, cells):
         return tuple(a[cells] for a in self.cell_arrays())
 
-    def feat_xt(self, xt, vc, Bv, xc):
+    def feat_xt(self, xt, y0=None):
         import jax.numpy as jnp
 
-        v = vc + (xt[:3] - xc) @ Bv
-        return jnp.concatenate([v, jnp.reshape(self.tau(xt[3]), (1,))])
+        xn = 2.0 * (xt[:3] - self.lo) / (self.hi - self.lo) - 1.0
+        parts = [xn, jnp.reshape(self.tau(xt[3]), (1,))]
+        if y0 is not None:
+            parts.append(jnp.asarray(y0, xn.dtype))
+        return jnp.concatenate(parts)
 
-    def feat_nodes_t(self, t):
+    def feat_nodes_t(self, t, m=None):
         import jax.numpy as jnp
 
+        if m is not None:
+            raise NotImplementedError("a family of reservoirs needs the spectral encoding")
+        xn = 2.0 * (self.node_xyz - self.lo[None, :]) / (self.hi - self.lo)[None, :] - 1.0
         tn = self.tau(t)
-        col = jnp.full((self.v_nodes.shape[0], 1), tn, self.v_nodes.dtype)
-        return jnp.concatenate([self.v_nodes, col], axis=1)
+        col = jnp.full((xn.shape[0], 1), tn, xn.dtype)
+        parts = [xn, col]
+        if self.y0_nodes is not None:
+            parts.append(jnp.asarray(self.y0_nodes, xn.dtype))
+        return jnp.concatenate(parts, axis=1)
+
+
+def raw_ic_offsets(case: CaseData, spec: SpectralBundle | None, eps: float = 1e-4):
+    r"""
+    The logit-space image of the deck's initial condition, per cell and per node,
+    for the hard-IC ansatz.
+
+    .. math::
+
+        y^0_1 = \sigma^{-1}\!\Bigl(\frac{p^0 - P_{\min}}{P_{\max} - P_{\min}}\Bigr),\quad
+        y^0_2 = \sigma^{-1}\!\Bigl(\frac{S_w^0 - S_{wc}}{1 - S_{wc}}\Bigr),\quad
+        y^0_3 = \sigma^{-1}\!\Bigl(\frac{S_g^0}{1 - S_w^0}\Bigr),\quad
+        y^0_4 = \sigma^{-1}\!\Bigl(\frac{R_s^0}{R_{s,\max}}\Bigr)
+
+    where:
+    - every sigmoid argument is clamped to :math:`[\epsilon_\sigma, 1 - \epsilon_\sigma]` before the logit: :math:`S_g^0 = 0` (undersaturated cells) and :math:`S_w^0 = S_{wc}` have infinite logits, so the hard IC holds to within :math:`\epsilon_\sigma` of the range, not exactly.
+    - nodal values are the volume-weighted vertex averages of the cell values (the same lumping that builds the nodal porosity), so the whole-mesh evaluator anchors on a consistent field.
+
+    Returns ``(y0_cells (n_cells, 4), y0_nodes (n_nodes, 4) | None, n_clamped)``.
+    """
+    import jax.numpy as jnp
+    import numpy as onp
+
+    phys = case.phys
+    y = onp.asarray(case.y_ic, onp.float64)
+    p_min, p_max, swc, rs_max = float(phys.P_MIN), float(phys.P_MAX), float(phys.SWC), float(phys.RS_MAX)
+    u = onp.stack([(y[:, 0] - p_min) / (p_max - p_min),
+                   (y[:, 1] - swc) / max(1.0 - swc, 1e-12),
+                   y[:, 2] / onp.maximum(1.0 - y[:, 1], 1e-12),
+                   y[:, 3] / max(rs_max, 1e-12)], axis=1)
+    n_clamped = int(((u < eps) | (u > 1.0 - eps)).sum())
+    u = onp.clip(u, eps, 1.0 - eps)
+    y0_cells = onp.log(u / (1.0 - u)).astype(onp.float32)
+    y0_nodes = None
+    if spec is not None:
+        static = spec.static
+        hex_nodes = onp.asarray(static["hex_nodes"])
+        share = onp.asarray(jnp.einsum("eg,ega->ea", static["JxW"], static["N"]))   # (n_hex, 8)
+        n_v = int(static["n_vertices"])
+        acc = onp.zeros((n_v, 4)); vol = onp.zeros((n_v,))
+        onp.add.at(acc, hex_nodes.reshape(-1), (share[:, :, None] * y0_cells[:, None, :]).reshape(-1, 4))
+        onp.add.at(vol, hex_nodes.reshape(-1), share.reshape(-1))
+        y0_nodes = (acc / onp.maximum(vol, 1e-30)[:, None]).astype(onp.float32)
+    return jnp.asarray(y0_cells), (None if y0_nodes is None else jnp.asarray(y0_nodes)), n_clamped
 
 
 def perforation_xyz(case: CaseData):
@@ -201,9 +378,10 @@ def well_log_radius(xyz, perf_xyz, r0: float, r_max: float):
     return phi.astype(onp.float32), grad.astype(onp.float32)
 
 
-def _with_well_channel(cfg: RunConfig, case: CaseData, spec: SpectralBundle):
-    """The spectral feature arrays with the near-well channel appended: ``(v_c, b_v, v_nodes)``."""
-    import jax.numpy as jnp
+def well_channel_geometry(cfg: RunConfig, case: CaseData):
+    """``(perf_xyz, r0, r_max)`` of the near-well channel: the perforated-cell centroids, the
+    inner cutoff (``well_enc_r0_ft``, or half the smallest edge of the perforated cells) and
+    the largest centroid distance to the nearest perforation."""
     import numpy as onp
 
     from .wells import _repack_steps
@@ -216,32 +394,83 @@ def _with_well_channel(cfg: RunConfig, case: CaseData, spec: SpectralBundle):
         0.5 * onp.asarray(case.cell_len, onp.float64)[cells].min())
     cent = onp.asarray(case.centroids, onp.float64)
     r_max = float(onp.sqrt(((cent[:, None, :] - perf[None, :, :]) ** 2).sum(-1)).min(1).max())
-    r_max = max(r_max, 2.0 * r0)
+    return perf, r0, max(r_max, 2.0 * r0)
+
+
+def well_channel_centroids(cfg: RunConfig, case: CaseData):
+    """The near-well channel at the cell centroids, ``(n_cells,)`` float64, or ``None`` when
+    the encoding carries none — what the addressability gate tests beside the modes."""
+    import numpy as onp
+
+    if cfg.well_encoding != "logr" or cfg.input_encoding is not InputEncoding.SPECTRAL:
+        return None
+    perf, r0, r_max = well_channel_geometry(cfg, case)
+    return onp.asarray(well_log_radius(onp.asarray(case.centroids, onp.float64), perf, r0, r_max)[0],
+                       onp.float64)
+
+
+def _with_well_channel(cfg: RunConfig, case: CaseData, spec: SpectralBundle, v_c, b_v, v_nodes):
+    """The feature arrays ``(v_c, b_v, v_nodes)`` with the near-well channel appended."""
+    import jax.numpy as jnp
+    import numpy as onp
+
+    perf, r0, r_max = well_channel_geometry(cfg, case)
+    cent = onp.asarray(case.centroids, onp.float64)
     phi_c, grad_c = well_log_radius(cent, perf, r0, r_max)
     phi_n, _ = well_log_radius(onp.asarray(spec.node_xyz, onp.float64), perf, r0, r_max)
-    v_c = jnp.concatenate([jnp.asarray(spec.v_c), jnp.asarray(phi_c)[:, None]], axis=1)
-    b_v = jnp.concatenate([jnp.asarray(spec.b_v), jnp.asarray(grad_c)[:, :, None]], axis=2)
-    v_nodes = jnp.concatenate([jnp.asarray(spec.v_nodes), jnp.asarray(phi_n)[:, None]], axis=1)
+    v_c = jnp.concatenate([jnp.asarray(v_c), jnp.asarray(phi_c)[:, None]], axis=1)
+    b_v = jnp.concatenate([jnp.asarray(b_v), jnp.asarray(grad_c)[:, :, None]], axis=2)
+    v_nodes = jnp.concatenate([jnp.asarray(v_nodes), jnp.asarray(phi_n)[:, None]], axis=1)
     print(f"[encoder] near-well channel ln r_w: {perf.shape[0]} perforation(s), "
           f"r_0 = {r0:.1f} ft, r_max = {r_max:.0f} ft")
     return v_c, b_v, v_nodes
 
 
-def make_encoder(cfg: RunConfig, case: CaseData, spec: SpectralBundle):
-    """Build the spectral encoder over a provisioned eigenbasis; under
-    ``well_encoding="logr"`` it also carries the near-well channel (:func:`well_log_radius`)."""
-    from .config import dim_in_of
+def make_encoder(cfg: RunConfig, case: CaseData, spec: SpectralBundle | None, family=None):
+    """Build the configured encoder (spectral needs a provisioned eigenbasis); under
+    ``ic_design="hard"`` the encoder also carries the raw IC offsets (:func:`raw_ic_offsets`),
+    under ``depth_encoding="z"`` the depth channel the bundle provisioned
+    (:func:`modules.spectral.depth_features`), and under ``well_encoding="logr"`` the
+    near-well channel (:func:`well_log_radius`), in that order after the eigenfeatures."""
+    from .config import depth_channel, dim_in_of, hard_ic
 
     extra = {}
     if cfg.time_encoding == "log":
         extra["t_warp"] = resolve_time_warp(case.times, float(case.t_end), cfg.time_warp_days)
         print(f"[encoder] log time channel: t_w = {extra['t_warp']:.4g} d "
               f"({'auto' if cfg.time_warp_days <= 0 else 'set'}) over T_end = {float(case.t_end):.4g} d")
-    if spec is None or spec.v_c is None:
-        raise ValueError("spectral encoding requires a provisioned eigenbasis bundle")
-    v_c, b_v, v_nodes = spec.v_c, spec.b_v, spec.v_nodes
-    if cfg.well_encoding == "logr":
-        v_c, b_v, v_nodes = _with_well_channel(cfg, case, spec)
-    return SpectralEncoder(v_c=v_c, b_v=b_v, centroids=spec.centroids,
-                           v_nodes=v_nodes, t_end=case.t_end, dim_in=dim_in_of(cfg),
-                           **extra)
+    if hard_ic(cfg):
+        y0_c, y0_n, n_clamped = raw_ic_offsets(case, spec)
+        extra.update(y0_cells=y0_c, y0_nodes=y0_n)
+        if n_clamped:
+            print(f"[ic] hard IC: {n_clamped} of {4 * case.n_cells} initial primaries sit on a "
+                  "sigmoid rail (S_g = 0 / S_w = S_wc) and are anchored to within 1e-4 of the range")
+    if cfg.input_encoding is InputEncoding.SPECTRAL:
+        if spec is None or spec.v_c is None:
+            raise ValueError("spectral encoding requires a provisioned eigenbasis bundle")
+        v_c, b_v, v_nodes = spec.v_c, spec.b_v, spec.v_nodes
+        if depth_channel(cfg):
+            import jax.numpy as jnp
+
+            if spec.z_c is None:
+                raise ValueError("depth_encoding needs the depth channel provisioned with the "
+                                 "eigenbasis (spectral.provision under the same config)")
+            v_c = jnp.concatenate([jnp.asarray(v_c), jnp.asarray(spec.z_c)], axis=1)
+            b_v = jnp.concatenate([jnp.asarray(b_v), jnp.asarray(spec.z_grad)], axis=2)
+            v_nodes = jnp.concatenate([jnp.asarray(v_nodes), jnp.asarray(spec.z_nodes)], axis=1)
+            print("[encoder] depth channel: standardized z appended to the eigenfeatures")
+        if cfg.well_encoding == "logr":
+            v_c, b_v, v_nodes = _with_well_channel(cfg, case, spec, v_c, b_v, v_nodes)
+        if family is not None:                     # a family of reservoirs: the property channel
+            extra.update(m_table=family.m_table, n_cells=int(case.n_cells))
+            print(f"[encoder] property channel: {int(family.m_table.shape[1])} whitened properties of "
+                  f"{int(family.m_table.shape[0])} samples")
+        return SpectralEncoder(v_c=v_c, b_v=b_v, centroids=spec.centroids,
+                               v_nodes=v_nodes, t_end=case.t_end, dim_in=dim_in_of(cfg),
+                               **extra)
+    node_xyz = spec.node_xyz if spec is not None else None
+    if node_xyz is None:
+        import jax.numpy as jnp
+
+        node_xyz = jnp.asarray(case.verts, jnp.float32)
+    return CartesianEncoder(lo=case.lo, hi=case.hi, node_xyz=node_xyz, t_end=case.t_end, **extra)

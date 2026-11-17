@@ -48,13 +48,13 @@ def make_nodal_evaluator(cfg: RunConfig, env: MeshEnv, encoder, primaries_feat: 
     per_dev = (n_nodes + pad) // data_dim
     bs = per_dev if cfg.fem_chunk <= 0 else min(cfg.fem_chunk, per_dev)
 
-    def primaries_nodes(params, t):
-        feats = encoder.feat_nodes_t(t)
+    def primaries_nodes(params, t, m=None):
+        feats = encoder.feat_nodes_t(t, m) if m is not None else encoder.feat_nodes_t(t)
         return jax.vmap(lambda f: primaries_feat(params, f))(feats)
 
-    def nodes_P_dPdt(params, t):
+    def nodes_P_dPdt(params, t, m=None):
         def _eval_all(tt):
-            feats = encoder.feat_nodes_t(tt)
+            feats = encoder.feat_nodes_t(tt, m) if m is not None else encoder.feat_nodes_t(tt)
             if pad:
                 feats = jnp.concatenate([feats, jnp.zeros((pad, feats.shape[1]), feats.dtype)])
             rows = jax.lax.with_sharding_constraint(

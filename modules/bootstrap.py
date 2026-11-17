@@ -1,11 +1,17 @@
 r"""
 Pre-jax environment bootstrap (port of notebook cell 1).
 
-Everything here must run BEFORE the first ``import jax`` in the process:
-CUDA-12 ``ptxas`` selection for pre-Ampere GPUs, the stream-ordered
-``cuda_async`` allocator, the NCCL Socket-bootstrap pin that survives GCP A3
-images exporting a broken gIB plugin, and the x64 flag that backs the
-``selective_f64`` precision policy.
+Everything here must run BEFORE the first ``import jax`` in the process: the choice of
+accelerator (``JAX_PLATFORMS``), the backend-specific environment — on CUDA the
+CUDA-12 ``ptxas`` selection for pre-Ampere GPUs, the stream-ordered ``cuda_async``
+allocator and the NCCL Socket-bootstrap pin that survives GCP A3 images exporting a
+broken gIB plugin; on an Intel XPU (the oneAPI PJRT plugin) only the on-demand
+allocator — and the x64 flag that backs the ``selective_f64`` precision policy.
+
+Accelerators are named by the user as ``"cuda"`` (NVIDIA, ``jax[cuda12]``) or ``"xpu"``
+(Intel, ``jax[oneapi]``); ``"auto"`` picks whichever plugin the environment has
+installed, falling back to the CPU. ``"xpu"`` is Intel's name for the device; the
+plugin registers the JAX platform as ``oneapi``, which is what ``JAX_PLATFORMS`` receives.
 
 The module is idempotent: calling :func:`setup_environment` twice with the
 same policy is a no-op; calling it after jax was already initialized with a
@@ -17,11 +23,15 @@ from __future__ import annotations
 import ctypes
 import importlib.util
 import os
-import shutil
 import sys
 from pathlib import Path
 
 _CONFIGURED_POLICY: str | None = None
+# Per-deck ceiling of the persistent compilation cache, least recently used entries evicted
+# first: a NORNE ENGD step serializes to ~0.5 GB with the case arrays it closes over. A
+# workstation's scratch disk is 8 GiB and also holds the simulator's results and the prep
+# and spectral caches, so the cache keeps a few configurations, not a dozen.
+_COMPILE_CACHE_MAX_BYTES = 2 << 30
 
 #: Where a container platform may mount the NVIDIA driver without putting it
 #: on the loader path (GKE: ``/usr/local/nvidia/lib64``). ``LD_LIBRARY_PATH``
@@ -36,10 +46,10 @@ def ensure_driver_visible() -> str | None:
     Make the NVIDIA driver library loadable before jax's CUDA plugin looks for it.
 
     Returns the path that had to be preloaded, ``None`` when the loader already
-    finds ``libcuda.so.1``. Raises with a plain diagnosis when a GPU device is
-    present but no driver library can be found anywhere: jax's own message in
-    that situation ("Backend 'cuda' is not in the list of known backends") hides
-    the cause, which is the container's library path, not jax.
+    finds ``libcuda.so.1``. Raises with a plain diagnosis when CUDA was asked for
+    but no driver library can be found anywhere: jax's own message in that
+    situation ("Backend 'cuda' is not in the list of known backends") hides the
+    cause, which is the container's library path, not jax.
 
     Preloading works because glibc satisfies a later ``dlopen("libcuda.so.1")``
     from an object already loaded under that SONAME.
@@ -60,16 +70,108 @@ def ensure_driver_visible() -> str | None:
             )
             return str(path)
     raise RuntimeError(
-        "A GPU device is present but the NVIDIA driver library libcuda.so.1 is not "
-        "visible to this process: it is neither on the loader path nor under "
+        "CUDA was requested but the NVIDIA driver library libcuda.so.1 is not visible to "
+        "this process: it is neither on the loader path nor under "
         f"{', '.join(_DRIVER_DIRS)}. On GKE the driver is mounted at /usr/local/nvidia/lib64 "
         "and the container must carry it in LD_LIBRARY_PATH; on other hosts install the "
         "NVIDIA driver or run on the CPU (JAX_PLATFORMS=cpu)."
     )
 
 
+def _driver_loaded() -> bool:
+    try:
+        ctypes.CDLL(_DRIVER_SONAME)
+        return True
+    except OSError:
+        return False
+
+
+def platforms_for_host(max_cpu_devices: int = 8) -> str:
+    """The ``JAX_PLATFORMS`` value for this host: the caller's own when set, else the
+    installed accelerator ahead of the CPU (:func:`default_platforms`). On a host with no
+    accelerator the XLA flag that splits the CPU into up to ``max_cpu_devices`` devices is
+    set too, so the data-parallel mesh has something to shard over."""
+    forced = os.environ.get("JAX_PLATFORMS")
+    if forced:
+        return forced
+    platforms = default_platforms()
+    if platforms == "cpu":
+        n = max(1, min(max_cpu_devices, os.cpu_count() or 1))
+        flags = os.environ.get("XLA_FLAGS", "")
+        if "--xla_force_host_platform_device_count" not in flags:
+            os.environ["XLA_FLAGS"] = f"{flags} --xla_force_host_platform_device_count={n}".strip()
+    return platforms
+
+
+# user-facing accelerator name -> (JAX platform name, the plugin modules that provide it)
+_ACCELERATORS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "cuda": ("cuda", ("jax_plugins.xla_cuda12", "jax_plugins.xla_cuda13")),
+    "xpu": ("oneapi", ("jax_plugins.xla_oneapi",)),
+}
+_ALIASES = {"oneapi": "xpu", "gpu": "cuda"}   # JAX's own names, accepted in place of ours
+
+
+def _find_spec(name: str):
+    """``importlib.util.find_spec`` that returns ``None`` when a parent package is absent too."""
+    try:
+        return importlib.util.find_spec(name)
+    except ModuleNotFoundError:     # find_spec imports the parent, which raises instead of None
+        return None
+
+
+def _plugin_installed(modules: tuple[str, ...]) -> bool:
+    return any(_find_spec(m) is not None for m in modules)
+
+
+def installed_accelerators() -> list[str]:
+    """The accelerator names (``"cuda"``, ``"xpu"``) whose JAX plugin this environment has."""
+    return [name for name, (_, mods) in _ACCELERATORS.items() if _plugin_installed(mods)]
+
+
+def default_platforms() -> str:
+    """``JAX_PLATFORMS`` for ``"auto"``: the installed accelerator ahead of the CPU, else the CPU."""
+    found = installed_accelerators()
+    return f"{_ACCELERATORS[found[0]][0]},cpu" if found else "cpu"
+
+
+def normalize_platforms(platforms: str) -> str:
+    r"""
+    Translate an accelerator choice into a ``JAX_PLATFORMS`` value.
+
+    ``"auto"`` resolves through :func:`default_platforms`; a bare accelerator name
+    (``"cuda"``, ``"xpu"``, or JAX's own ``"oneapi"``/``"gpu"``) is put ahead of the CPU;
+    any comma-separated list is passed through token by token with the same renaming,
+    so ``"xpu,cpu"`` and ``"cpu"`` mean what they say. Raises :class:`RuntimeError` when
+    the chosen accelerator's plugin is not installed, naming the ``jax[...]`` extra.
+    """
+    platforms = platforms.strip().lower()
+    if platforms == "auto":
+        return default_platforms()
+    tokens = [_ALIASES.get(t.strip(), t.strip()) for t in platforms.split(",") if t.strip()]
+    if len(tokens) == 1 and tokens[0] in _ACCELERATORS:
+        tokens.append("cpu")
+    out = []
+    for tok in tokens:
+        if tok in _ACCELERATORS:
+            platform, mods = _ACCELERATORS[tok]
+            if not _plugin_installed(mods):
+                extra = {"cuda": "jax[cuda12]", "xpu": "jax[oneapi]"}[tok]
+                have = installed_accelerators()
+                alt = repr(have[0]) if have else "'cpu'"
+                raise RuntimeError(
+                    f"accelerator {tok!r} was requested but {extra} is not installed in this "
+                    f"environment (it has {alt}). Install it, or pick 'auto' / {alt}.")
+            tok = platform
+        out.append(tok)
+    return ",".join(out)
+
+
 def _cuda_requested(platforms: str) -> bool:
     return "cuda" in platforms.lower()
+
+
+def _xpu_requested(platforms: str) -> bool:
+    return "oneapi" in platforms.lower()
 
 
 def setup_environment(
@@ -90,9 +192,11 @@ def setup_environment(
         Float64 master weights + optimizer moments. Requires
         ``selective_f64`` (x64 enabled).
     platforms:
-        Overrides ``JAX_PLATFORMS``. When ``None`` an existing environment
-        value is respected (e.g. the CPU-pinned test suite) and
-        ``"cuda,cpu"`` is used as the default otherwise.
+        The accelerator: ``"auto"`` (whichever of ``jax[cuda12]`` / ``jax[oneapi]`` is
+        installed, else the CPU), ``"cuda"`` (NVIDIA), ``"xpu"`` (Intel oneAPI),
+        ``"cpu"``, or a raw ``JAX_PLATFORMS`` list such as ``"xpu,cpu"``; see
+        :func:`normalize_platforms`. When ``None`` an existing ``JAX_PLATFORMS`` value is
+        respected (e.g. the CPU-pinned test suite) and ``"auto"`` is used otherwise.
     """
     global _CONFIGURED_POLICY
 
@@ -115,16 +219,23 @@ def setup_environment(
         return
 
     if platforms is not None:
-        os.environ["JAX_PLATFORMS"] = platforms
+        os.environ["JAX_PLATFORMS"] = normalize_platforms(platforms)
+    elif os.environ.get("JAX_PLATFORMS"):
+        os.environ["JAX_PLATFORMS"] = normalize_platforms(os.environ["JAX_PLATFORMS"])
     else:
-        os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+        os.environ["JAX_PLATFORMS"] = default_platforms()
     effective_platforms = os.environ["JAX_PLATFORMS"]
+
+    if _xpu_requested(effective_platforms):
+        # An Arc iGPU draws its memory from the host's: grow the pool on demand rather than
+        # taking about 1 GB of it up front.
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
     if _cuda_requested(effective_platforms):
         ensure_driver_visible()
         # CUDA 13 no longer assembles code for the V100/T4 compute capabilities; select the
         # CUDA 12 compiler shipped by the pinned jax[cuda12] environment.
-        cuda_nvcc_spec = importlib.util.find_spec("nvidia.cuda_nvcc")
+        cuda_nvcc_spec = _find_spec("nvidia.cuda_nvcc")
         if cuda_nvcc_spec is None or not cuda_nvcc_spec.submodule_search_locations:
             raise RuntimeError("The pinned jax[cuda12] runtime is missing nvidia-cuda-nvcc-cu12.")
         cuda12_root = Path(next(iter(cuda_nvcc_spec.submodule_search_locations))).resolve()
@@ -170,30 +281,52 @@ def setup_environment(
             )
 
 
-def _driver_loaded() -> bool:
+def use_compilation_cache(cfg) -> Path | None:
+    r"""
+    Point JAX's persistent compilation cache at ``<work_dir>/jax_cache``.
+
+    Every jitted program of a run closes over its deck's arrays, so its compiled form is
+    specific to the deck; keeping the cache in the deck's work directory lets a later job
+    on the same deck load the executables — above all the ENGD step, which takes minutes
+    to compile at Norne scale — instead of compiling them again. The
+    cache is keyed by the compiled program itself (its HLO, compile options and the
+    backend), so a changed configuration simply misses it; only programs that took at
+    least ``jax_persistent_cache_min_compile_time_secs`` (1 s by default) are written,
+    and XLA's GPU autotuning results are kept beside them. An executable carries the
+    case arrays its program closes over (a NORNE ENGD step is about 0.5 GB on disk), so
+    the directory is capped at ``_COMPILE_CACHE_MAX_BYTES`` with least-recently-used
+    eviction unless ``JAX_COMPILATION_CACHE_MAX_SIZE`` sets another limit.
+
+    Switching directories mid-process re-initializes JAX's cache on the next compile. A
+    directory the user configured explicitly (``JAX_COMPILATION_CACHE_DIR``) is left as it
+    is, and nothing is created while the cache is switched off
+    (``JAX_ENABLE_COMPILATION_CACHE=false``, as the test suite runs). Returns the directory
+    in use, or ``None`` when there is none.
+    """
+    import jax
+
+    if not jax.config.jax_enable_compilation_cache:
+        return None
+    if os.environ.get("JAX_COMPILATION_CACHE_DIR"):
+        return Path(os.environ["JAX_COMPILATION_CACHE_DIR"])
+    if not getattr(cfg, "work_dir", ""):
+        return None
+    path = Path(cfg.work_dir) / "jax_cache"
     try:
-        ctypes.CDLL(_DRIVER_SONAME)
-        return True
+        path.mkdir(parents=True, exist_ok=True)
     except OSError:
-        return False
+        return None
+    if jax.config.jax_compilation_cache_dir != str(path):
+        jax.config.update("jax_compilation_cache_dir", str(path))
+        if not os.environ.get("JAX_COMPILATION_CACHE_MAX_SIZE"):
+            jax.config.update("jax_compilation_cache_max_size", _COMPILE_CACHE_MAX_BYTES)
+        try:
+            from jax._src import compilation_cache
 
-
-def platforms_for_host(max_cpu_devices: int = 8) -> str:
-    """``"cuda,cpu"`` when an NVIDIA device is visible, else ``"cpu"`` — and on CPU
-    the XLA flag that splits the host into up to ``max_cpu_devices`` devices, so the
-    data-parallel mesh has something to shard over. ``JAX_PLATFORMS`` set by the
-    caller wins."""
-    forced = os.environ.get("JAX_PLATFORMS")
-    if forced:
-        return forced
-    has_gpu = Path("/dev/nvidia0").exists() or shutil.which("nvidia-smi") is not None
-    if has_gpu:
-        return "cuda,cpu"
-    n = max(1, min(max_cpu_devices, os.cpu_count() or 1))
-    flags = os.environ.get("XLA_FLAGS", "")
-    if "--xla_force_host_platform_device_count" not in flags:
-        os.environ["XLA_FLAGS"] = f"{flags} --xla_force_host_platform_device_count={n}".strip()
-    return "cpu"
+            compilation_cache.reset_cache()      # takes the new directory on the next compile
+        except (ImportError, AttributeError):
+            pass
+    return path
 
 
 def env_summary() -> dict:
@@ -204,6 +337,7 @@ def env_summary() -> dict:
     return {
         "jax": jax.__version__,
         "backend": jax.default_backend(),
+        "platforms": os.environ.get("JAX_PLATFORMS", ""),
         "device_count": jax.device_count(),
         "devices": [d.device_kind for d in devices],
         "x64": bool(jax.config.jax_enable_x64),

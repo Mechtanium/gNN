@@ -101,6 +101,30 @@ def _make_dgm_classes():
     return DGMBlock, DGMNet
 
 
+def _make_mlp_classes():
+    """MLP NNX module classes (tanh hidden layers, linear readout)."""
+    import jax.numpy as jnp
+    from flax import nnx
+
+    class MLPLayer(nnx.Module):
+        def __init__(self, W, b):
+            self.W = nnx.Param(W)
+            self.b = nnx.Param(b)
+
+    class MLPNet(nnx.Module):
+        def __init__(self, raw_params):
+            self.layers = nnx.data([MLPLayer(W, b) for (W, b) in raw_params])
+
+        def __call__(self, inputs):
+            x = inputs
+            for layer in self.layers[:-1]:
+                x = jnp.tanh(x @ layer.W[...] + layer.b[...])
+            last = self.layers[-1]
+            return x @ last.W[...] + last.b[...]
+
+    return MLPLayer, MLPNet
+
+
 @dataclass
 class ModelBundle:
     """A built network: functional apply + init state + sharding map + parity references."""

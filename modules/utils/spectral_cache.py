@@ -15,14 +15,40 @@ grows with the requested mode count :math:`N`, so re-running it on every kernel 
 merely to raise :math:`N` -- is wasteful. This module persists the result and serves it
 back whenever the *control-panel knobs that produced it* are unchanged.
 
-The cache is **two-tier**, mirroring the two cost regimes:
+The cache has four tiers, mirroring the cost regimes of one run's preparation:
 
 - **operator tier** :math:`\mathcal O=\{\texttt{STATIC},A,M,c\}` -- the
   :math:`N`-independent FEM operators (assembly + connected-component count), keyed by
   :math:`\kappa_{\mathrm{op}}=(\text{model},\ \text{weighting},\ \text{mesh fingerprint})`.
 - **eigenbasis tier** :math:`\mathcal E_N=\{\lambda_{1:N},V_{1:N},V^c_{1:N},B^v_{1:N},
   \boldsymbol\mu_{1:N},\boldsymbol\sigma_{1:N}\}` -- the standardized modes and their
-  centroid affine maps, keyed by :math:`(\kappa_{\mathrm{op}},N)`.
+  centroid affine maps, keyed by :math:`\kappa_{\mathrm{op}}`, the resolved vertical
+  reservation and the selection settings, at the width :math:`N` last written for that
+  key (a wider request re-solves and replaces it; narrower ones are column slices).
+- **pool tier** -- the candidate pool :math:`\{\lambda, V, \upsilon\}` that the
+  addressability-floor search of :func:`pinnlab.spectral.resolve_n_eig` selects from
+  (the deflated family, if any, then the widest lowest-:math:`\lambda` band solved so
+  far), so a changed adequacy gate re-runs the cheap search, and a search that needs a
+  wider band resumes from it, instead of repeating the eigensolve.
+- **floor tier** -- the resolved addressability floor itself, so a notebook preview, the
+  pipeline build that follows it, and every later kernel start agree on one width without
+  re-solving anything.
+
+Every entry lives in its own directory named by a digest of its key, under the
+operator entry it derives from::
+
+    spectral_cache/
+        op-<digest>/                    operator tier
+            eig-<digest>/               eigenbasis tier (one per selection key)
+            pool-<digest>/              pool tier (one per candidate-search key)
+            floor-<digest>.json         floor tier (one per resolution key)
+
+so configurations that differ only in a weighting, a selection knob or a perturbed rock
+field coexist instead of overwriting one another. Files written by the earlier
+single-slot layout (directly inside ``spectral_cache/``) are still served when their key
+matches and no keyed entry supersedes them, and are never overwritten. Writes go through a temporary file and an atomic
+rename, metadata last, so an interrupted or concurrent writer never leaves a partial
+entry that reads as valid.
 
 Because ``eigsh(which="SM")`` returns the modes in ascending :math:`\lambda` and the
 node-wise standardization is applied *per column*, an eigenbasis cached at width
@@ -46,6 +72,7 @@ where:
 - :math:`V_{1:N}=(V-\boldsymbol\mu)/\boldsymbol\sigma`: the per-node, per-column
   standardized encoding; :math:`V^c,\ B^v`: its centroid value and physical gradient
   (the per-cell affine map used by the ``chain_rule`` residual).
+- :math:`\upsilon`: the per-mode vertical variance fraction of the candidates.
 - :math:`\kappa_{\mathrm{op}}`: the operator cache key -- the control-panel knobs and a
   content fingerprint of the mesh/rock arrays that uniquely determine :math:`\mathcal O`.
 """
@@ -53,7 +80,11 @@ where:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -61,23 +92,37 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
 
+from modules.utils.portable_paths import portable_path
+
 # v2: storage-weighted mass operator, vertical-aware retention (n_eig_z key,
 # per-mode vertical variance fraction) and the geometric-mass mode images.
 # v3: the retained set additionally depends on the SpectralSettings knobs that
 # steer selection (candidate-spectrum strategy, per-component stratification and
 # the pore-volume prune), so those enter the eigenbasis-tier key.
-SPECTRAL_CACHE_VERSION = 3
+# v4: every solver path returns M-orthonormal modes with a fixed sign, the deflated
+# family leads a band orthogonalized against it, and the vertical-column grouping is
+# part of every selection key.
+SPECTRAL_CACHE_VERSION = 4
+
+# Version of the pool and floor tiers: bumped whenever the candidate solvers change what
+# they return (v1: exact sparse deflation, band grown geometrically during the search;
+# v2: the band deflates the per-component constants instead of dropping the lowest
+# Lanczos pairs; v3: M-orthonormal pools and the nearest-neighbour separation test), so a
+# pool or floor found by an earlier solver is recomputed.
+RESOLUTION_CACHE_VERSION = 3
 
 # SpectralSettings fields that change *which* modes are retained, and so make two
 # cached bases non-interchangeable by column slicing. Tuning that only affects how
 # the candidate band is searched (band_cap_mult, dense_eig_max_n) is deliberately
 # excluded: it may change cost, never the selected set at a converged search.
 EIG_SELECTION_KEYS = ("retention", "stratify_components", "min_comp_vol_frac",
-                      "upsilon_vertical", "column_tol_ft")
+                      "upsilon_vertical", "column_tol_ft", "column_grouping")
 
 
 def eig_selection_key(spec: Any) -> dict[str, Any]:
-    """The ``SpectralSettings`` subset that participates in the eigenbasis cache key."""
+    """The ``SpectralSettings`` subset that participates in the eigenbasis cache key,
+    the vertical-column grouping among it (the vertical variance fractions, hence the
+    retained set, are measured against the columns)."""
     return {f"spec_{k}": _json_ready(getattr(spec, k)) for k in EIG_SELECTION_KEYS}
 
 # operator-tier files (N_EIG-independent)
@@ -89,11 +134,16 @@ _OP_MASS = "operators_mass.npz"
 # eigenbasis-tier files (depend on N_EIG; column-sliceable)
 _EIG_META = "eigenbasis_meta.json"
 _EIG_DATA = "eigenbasis.npz"
-_POOL_DATA = "candidate_pool.npz"
-_POOL_META = "candidate_pool_meta.json"
+
+# pool-tier files (the floor search's candidate pool)
+_POOL_META = "pool_meta.json"
+_POOL_DATA = "pool.npz"
 
 # entries of the ``build_static_hex_fem`` dict that are python scalars, not arrays
 _STATIC_SCALAR_KEYS = ("n_vertices", "n_hex", "n_degenerate")
+
+# what a damaged or half-written entry raises on read; such an entry is treated as a miss
+_READ_ERRORS = (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile)
 
 
 # --------------------------------------------------------------------------- #
@@ -149,15 +199,33 @@ def operator_cache_key(
     The operators :math:`\{\texttt{STATIC},A,M,c\}` depend on the reservoir model, the
     Laplacian stiffness weighting (``perm_weighted`` vs ``geometric``, which changes
     :math:`A`), and the mesh/rock content (via :func:`fem_input_fingerprint`); ``n_nodes``
-    and ``n_hex`` are carried for a cheap human-readable shape check.
+    and ``n_hex`` are carried for a cheap human-readable shape check. The model path enters
+    in its home-relative form, so the entry a key names is the same under any account.
     """
     return {
-        "model_path": str(Path(model_path).resolve()),
+        "model_path": portable_path(Path(model_path).expanduser().resolve()),
         "laplacian_weighting": str(laplacian_weighting),
         "n_nodes": int(n_nodes),
         "n_hex": int(n_hex),
         "fem_fingerprint": str(fingerprint),
     }
+
+
+def key_digest(key: dict[str, Any]) -> str:
+    """12-hex SHA-1 of a key dict in canonical JSON form (the entry directory name)."""
+    canonical = json.dumps(_json_ready(key), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(canonical.encode()).hexdigest()[:12]
+
+
+def operator_entry_dir(cache_dir: str | Path, op_key: dict[str, Any]) -> Path:
+    """Directory of the operator entry ``op_key``; every derived tier nests inside it."""
+    return Path(cache_dir) / f"op-{key_digest(op_key)}"
+
+
+def _eig_entry_dir(cache_dir: str | Path, op_key: dict[str, Any], n_eig_z: int,
+                   sel_key: dict[str, Any] | None) -> Path:
+    sub = {"n_eig_z": int(n_eig_z), **(sel_key or {})}
+    return operator_entry_dir(cache_dir, op_key) / f"eig-{key_digest(sub)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +239,8 @@ def _json_ready(value: Any) -> Any:
         return int(value)
     if isinstance(value, (np.floating,)):
         return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
     if isinstance(value, dict):
         return {str(k): _json_ready(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -178,8 +248,26 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
+def _atomic_write(path: Path, write) -> None:
+    """Run ``write(fileobj)`` into a temporary sibling, then rename it onto ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, "xb") as f:                   # plain open: the umask sets the mode
+            write(f)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _write_meta(path: Path, meta: dict[str, Any]) -> None:
-    path.write_text(json.dumps(_json_ready(meta), indent=2, sort_keys=True) + "\n")
+    text = json.dumps(_json_ready(meta), indent=2, sort_keys=True) + "\n"
+    _atomic_write(path, lambda f: f.write(text.encode()))
+
+
+def _write_npz(path: Path, **arrays) -> None:
+    _atomic_write(path, lambda f: np.savez(f, **arrays))
 
 
 def _read_meta(path: Path) -> dict[str, Any] | None:
@@ -191,18 +279,19 @@ def _read_meta(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _key_matches(meta: dict[str, Any] | None, key: dict[str, Any]) -> bool:
-    """True iff ``meta`` carries the current cache version and every key field agrees."""
+def _key_matches(meta: dict[str, Any] | None, key: dict[str, Any],
+                 version: int = SPECTRAL_CACHE_VERSION) -> bool:
+    """True iff ``meta`` carries the expected cache version and every key field agrees."""
     if meta is None:
         return False
-    if int(meta.get("schema_version", -1)) != SPECTRAL_CACHE_VERSION:
+    if int(meta.get("schema_version", -1)) != version:
         return False
-    return all(meta.get(k) == v for k, v in key.items())
+    return all(meta.get(k) == v for k, v in _json_ready(key).items())
 
 
-def _save_static_dict(npz_path: Path, static: dict[str, Any]) -> None:
+def _save_static_dict(f, static: dict[str, Any]) -> None:
     """Serialize the ``build_static_hex_fem`` dict (jnp arrays + scalars) to one npz."""
-    np.savez(npz_path, **{k: np.asarray(v) for k, v in static.items()})
+    np.savez(f, **{k: np.asarray(v) for k, v in static.items()})
 
 
 def _load_static_dict(npz_path: Path) -> dict[str, Any]:
@@ -215,19 +304,28 @@ def _load_static_dict(npz_path: Path) -> dict[str, Any]:
     return out
 
 
+def _sparse_bytes(matrix) -> bytes:
+    buf = io.BytesIO()
+    sp.save_npz(buf, sp.csr_matrix(matrix))
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------------- #
 # operator tier (N_EIG-independent: STATIC, A, M, c)
 # --------------------------------------------------------------------------- #
+def _operator_dir(cache_dir: str | Path, key: dict[str, Any]) -> Path | None:
+    """The directory holding a complete operator entry for ``key``: the keyed entry, or
+    the legacy single-slot files directly in ``cache_dir``; ``None`` if neither matches."""
+    for d in (operator_entry_dir(cache_dir, key), Path(cache_dir)):
+        if (_key_matches(_read_meta(d / _OP_META), key)
+                and all((d / f).exists() for f in (_OP_STATIC, _OP_STIFFNESS, _OP_MASS))):
+            return d
+    return None
+
+
 def operator_cache_valid(cache_dir: str | Path, key: dict[str, Any]) -> bool:
     """True iff a complete operator cache matching ``key`` is present on disk."""
-    cache_dir = Path(cache_dir)
-    meta = _read_meta(cache_dir / _OP_META)
-    if not _key_matches(meta, key):
-        return False
-    return all(
-        (cache_dir / f).exists()
-        for f in (_OP_STATIC, _OP_STIFFNESS, _OP_MASS)
-    )
+    return _operator_dir(cache_dir, key) is not None
 
 
 def save_operator_cache(
@@ -245,34 +343,73 @@ def save_operator_cache(
     the key fields live in the JSON sidecar. The metadata is written *last* so a partial
     write is never seen as valid by :func:`operator_cache_valid`.
     """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _save_static_dict(cache_dir / _OP_STATIC, static)
-    sp.save_npz(cache_dir / _OP_STIFFNESS, sp.csr_matrix(A_lap))
-    sp.save_npz(cache_dir / _OP_MASS, sp.csr_matrix(M_lap))
+    d = operator_entry_dir(cache_dir, key)
+    _atomic_write(d / _OP_STATIC, lambda f: _save_static_dict(f, static))
+    stiff, mass = _sparse_bytes(A_lap), _sparse_bytes(M_lap)
+    _atomic_write(d / _OP_STIFFNESS, lambda f: f.write(stiff))
+    _atomic_write(d / _OP_MASS, lambda f: f.write(mass))
     meta = {**key, "schema_version": SPECTRAL_CACHE_VERSION, "n_null": int(n_null)}
-    _write_meta(cache_dir / _OP_META, meta)
+    _write_meta(d / _OP_META, meta)
 
 
 def load_operator_cache(
     cache_dir: str | Path, key: dict[str, Any]
 ) -> dict[str, Any] | None:
     r"""Load ``{static, A_lap, M_lap, n_null}`` if a matching cache exists, else ``None``."""
-    cache_dir = Path(cache_dir)
-    if not operator_cache_valid(cache_dir, key):
+    d = _operator_dir(cache_dir, key)
+    if d is None:
         return None
-    meta = _read_meta(cache_dir / _OP_META)
-    return {
-        "static": _load_static_dict(cache_dir / _OP_STATIC),
-        "A_lap": sp.load_npz(cache_dir / _OP_STIFFNESS),
-        "M_lap": sp.load_npz(cache_dir / _OP_MASS),
-        "n_null": int(meta["n_null"]),
-    }
+    try:
+        meta = _read_meta(d / _OP_META)
+        return {
+            "static": _load_static_dict(d / _OP_STATIC),
+            "A_lap": sp.load_npz(d / _OP_STIFFNESS),
+            "M_lap": sp.load_npz(d / _OP_MASS),
+            "n_null": int(meta["n_null"]),
+        }
+    except _READ_ERRORS:
+        return None
 
 
 # --------------------------------------------------------------------------- #
 # eigenbasis tier (depends on N_EIG; column-sliceable)
 # --------------------------------------------------------------------------- #
+def _eig_meta_matches(meta: dict[str, Any] | None, op_key: dict[str, Any],
+                      n_eig_z: int | None, sel_key: dict[str, Any] | None) -> bool:
+    if not _key_matches(meta, op_key):
+        return False
+    if n_eig_z is not None and int(meta.get("n_eig_z", -1)) != int(n_eig_z):
+        return False
+    if sel_key is None:
+        return True
+    want = _json_ready(sel_key)
+    return all(meta.get(k) == v for k, v in want.items())
+
+
+def _eig_dir(cache_dir: str | Path, op_key: dict[str, Any], n_eig_z: int | None,
+             sel_key: dict[str, Any] | None) -> tuple[Path, int] | None:
+    """(directory, stored width) of the eigenbasis entry serving this key, if any.
+
+    A keyed entry is authoritative for its key; the legacy single-slot files are read only
+    when no keyed entry exists, so a basis written under the keyed layout is never
+    shadowed by an older, wider one. Without ``n_eig_z`` every keyed entry of the
+    operator is scanned and the widest match is reported.
+    """
+    if n_eig_z is not None:
+        keyed = [_eig_entry_dir(cache_dir, op_key, n_eig_z, sel_key)]
+    else:
+        keyed = sorted(operator_entry_dir(cache_dir, op_key).glob("eig-*"))
+    for dirs in (keyed, [Path(cache_dir)]):
+        hits = []
+        for d in dirs:
+            meta = _read_meta(d / _EIG_META)
+            if _eig_meta_matches(meta, op_key, n_eig_z, sel_key) and (d / _EIG_DATA).exists():
+                hits.append((d, int(meta["n_eig"])))
+        if hits:
+            return max(hits, key=lambda h: h[1])
+    return None
+
+
 def cached_eig_n_eig(cache_dir: str | Path, op_key: dict[str, Any],
                      n_eig_z: int | None = None,
                      sel_key: dict[str, Any] | None = None) -> int | None:
@@ -286,17 +423,8 @@ def cached_eig_n_eig(cache_dir: str | Path, op_key: dict[str, Any],
     :func:`eig_selection_key`) extends the same argument to the ``SpectralSettings``
     knobs that steer selection.
     """
-    cache_dir = Path(cache_dir)
-    meta = _read_meta(cache_dir / _EIG_META)
-    if not _key_matches(meta, op_key):
-        return None
-    if not (cache_dir / _EIG_DATA).exists():
-        return None
-    if n_eig_z is not None and int(meta.get("n_eig_z", -1)) != int(n_eig_z):
-        return None
-    if sel_key is not None and not all(meta.get(k) == v for k, v in sel_key.items()):
-        return None
-    return int(meta["n_eig"])
+    hit = _eig_dir(cache_dir, op_key, n_eig_z, sel_key)
+    return None if hit is None else hit[1]
 
 
 def save_eig_cache(
@@ -326,10 +454,9 @@ def save_eig_cache(
     truncation, and the trailing areal columns keep the ascending-:math:`\lambda`
     prefix property.
     """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        cache_dir / _EIG_DATA,
+    d = _eig_entry_dir(cache_dir, op_key, n_eig_z, sel_key)
+    _write_npz(
+        d / _EIG_DATA,
         lam=np.asarray(lam),
         v_nodes=np.asarray(v_nodes),
         v_c=np.asarray(v_c),
@@ -340,7 +467,7 @@ def save_eig_cache(
     )
     meta = {**op_key, **(sel_key or {}), "schema_version": SPECTRAL_CACHE_VERSION,
             "n_eig": int(n_eig), "n_eig_z": int(n_eig_z)}
-    _write_meta(cache_dir / _EIG_META, meta)
+    _write_meta(d / _EIG_META, meta)
 
 
 def load_eig_cache(
@@ -361,59 +488,96 @@ def load_eig_cache(
     only up to a rotation (both solves share the same spectrum and span). The returned
     dict also reports the on-disk width as ``n_eig_cached``.
     """
-    cache_dir = Path(cache_dir)
-    stored = cached_eig_n_eig(cache_dir, op_key, n_eig_z=n_eig_z, sel_key=sel_key)
-    if stored is None or stored < int(n_eig):
+    hit = _eig_dir(cache_dir, op_key, n_eig_z, sel_key)
+    if hit is None or hit[1] < int(n_eig):
         return None
+    d, stored = hit
     n = int(n_eig)
-    with np.load(cache_dir / _EIG_DATA, allow_pickle=False) as z:
-        return {
-            "lam": jnp.asarray(z["lam"][:n]),
-            "v_nodes": jnp.asarray(z["v_nodes"][:, :n]),
-            "v_c": jnp.asarray(z["v_c"][:, :n]),
-            "b_v": jnp.asarray(z["b_v"][:, :, :n]),
-            "v_mean": jnp.asarray(z["v_mean"][:n]),
-            "v_std": jnp.asarray(z["v_std"][:n]),
-            "upsilon": jnp.asarray(z["upsilon"][:n]),
-            "n_eig_cached": stored,
-        }
+    try:
+        with np.load(d / _EIG_DATA, allow_pickle=False) as z:
+            return {
+                "lam": jnp.asarray(z["lam"][:n]),
+                "v_nodes": jnp.asarray(z["v_nodes"][:, :n]),
+                "v_c": jnp.asarray(z["v_c"][:, :n]),
+                "b_v": jnp.asarray(z["b_v"][:, :, :n]),
+                "v_mean": jnp.asarray(z["v_mean"][:n]),
+                "v_std": jnp.asarray(z["v_std"][:n]),
+                "upsilon": jnp.asarray(z["upsilon"][:n]),
+                "n_eig_cached": stored,
+            }
+    except _READ_ERRORS:
+        return None
 
 
-def save_pool_cache(cache_dir: str | Path, op_key: dict[str, Any], *, ceiling: int,
-                    n_eig_z: int, lam_c: np.ndarray, v_cand: np.ndarray, ups_c: np.ndarray,
-                    n_forced: int, sel_key: dict[str, Any] | None = None) -> None:
-    r"""Persist the candidate pool the addressability floor is measured against.
+# --------------------------------------------------------------------------- #
+# pool and floor tiers (the addressability-floor search of resolve_n_eig)
+# --------------------------------------------------------------------------- #
+def _pool_dir(cache_dir: str | Path, op_key: dict[str, Any], pool_key: dict[str, Any]) -> Path:
+    return operator_entry_dir(cache_dir, op_key) / f"pool-{key_digest(pool_key)}"
 
-    The pool is a generalized eigensolve at ``ceiling`` width (``spec.n_eig_cap``);
-    on a mesh with degenerate eigenvalues the returned eigenvectors are only
-    defined up to a rotation inside each degenerate subspace, so two solves of
-    the same problem give *different* bases and, downstream, different losses.
-    Caching the pool makes every later run on the same deck reuse the identical
-    basis (and skips the most expensive step of resolution).
+
+def save_pool_cache(
+    cache_dir: str | Path,
+    op_key: dict[str, Any],
+    pool_key: dict[str, Any],
+    *,
+    lam: np.ndarray,
+    v: np.ndarray,
+    ups: np.ndarray,
+    n_forced: int,
+    k_band: int,
+) -> None:
+    r"""Persist a floor-search candidate pool under ``(op_key, pool_key)``.
+
+    The raw candidate modes are stored in float32 together with their eigenvalues and
+    vertical variance fractions; the sidecar records how many leading columns are the
+    unconditionally retained (deflated) family and the width of the
+    lowest-:math:`\lambda` band behind them. A wider pool for the same key replaces a
+    narrower one, so a later search resumes from the widest band solved so far.
     """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(cache_dir / _POOL_DATA, lam_c=np.asarray(lam_c), v_cand=np.asarray(v_cand),
-             ups_c=np.asarray(ups_c))
-    meta = {**op_key, **(sel_key or {}), "schema_version": SPECTRAL_CACHE_VERSION,
-            "ceiling": int(ceiling), "n_eig_z": int(n_eig_z), "n_forced": int(n_forced)}
-    (cache_dir / _POOL_META).write_text(json.dumps(meta, indent=2, sort_keys=True))
+    d = _pool_dir(cache_dir, op_key, pool_key)
+    _write_npz(d / _POOL_DATA, lam=np.asarray(lam), v=np.asarray(v, np.float32),
+               ups=np.asarray(ups))
+    meta = {**op_key, **pool_key, "schema_version": RESOLUTION_CACHE_VERSION,
+            "n_forced": int(n_forced), "k_band": int(k_band)}
+    _write_meta(d / _POOL_META, meta)
 
 
-def load_pool_cache(cache_dir: str | Path, op_key: dict[str, Any], *, ceiling: int,
-                    n_eig_z: int, sel_key: dict[str, Any] | None = None):
-    """The cached candidate pool as ``(lam_c, v_cand, ups_c, n_forced)``, or ``None``."""
-    cache_dir = Path(cache_dir)
-    meta_path, data_path = cache_dir / _POOL_META, cache_dir / _POOL_DATA
-    if not (meta_path.is_file() and data_path.is_file()):
+def load_pool_cache(
+    cache_dir: str | Path, op_key: dict[str, Any], pool_key: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The cached pool ``{lam, v, ups, n_forced, k_band}``, or ``None``."""
+    d = _pool_dir(cache_dir, op_key, pool_key)
+    meta = _read_meta(d / _POOL_META)
+    if not _key_matches(meta, {**op_key, **pool_key}, RESOLUTION_CACHE_VERSION):
         return None
     try:
-        meta = json.loads(meta_path.read_text())
-    except (OSError, ValueError):
+        with np.load(d / _POOL_DATA, allow_pickle=False) as z:
+            return {"lam": np.asarray(z["lam"]), "v": np.asarray(z["v"]),
+                    "ups": np.asarray(z["ups"]), "n_forced": int(meta["n_forced"]),
+                    "k_band": int(meta["k_band"])}
+    except _READ_ERRORS:
         return None
-    want = {**op_key, **(sel_key or {}), "schema_version": SPECTRAL_CACHE_VERSION,
-            "ceiling": int(ceiling), "n_eig_z": int(n_eig_z)}
-    if any(meta.get(k) != v for k, v in want.items()):
+
+
+def _floor_path(cache_dir: str | Path, op_key: dict[str, Any],
+                floor_key: dict[str, Any]) -> Path:
+    return operator_entry_dir(cache_dir, op_key) / f"floor-{key_digest(floor_key)}.json"
+
+
+def save_floor_cache(cache_dir: str | Path, op_key: dict[str, Any],
+                     floor_key: dict[str, Any], floor: int | None) -> None:
+    """Persist the resolved addressability floor (``None``: no width up to the cap works)."""
+    meta = {**op_key, **floor_key, "schema_version": RESOLUTION_CACHE_VERSION,
+            "floor": None if floor is None else int(floor)}
+    _write_meta(_floor_path(cache_dir, op_key, floor_key), meta)
+
+
+def load_floor_cache(cache_dir: str | Path, op_key: dict[str, Any],
+                     floor_key: dict[str, Any]) -> dict[str, Any] | None:
+    """``{"floor": int | None}`` when a floor was resolved under this key, else ``None``."""
+    meta = _read_meta(_floor_path(cache_dir, op_key, floor_key))
+    if not _key_matches(meta, {**op_key, **floor_key}, RESOLUTION_CACHE_VERSION):
         return None
-    with np.load(data_path) as z:
-        return z["lam_c"], z["v_cand"], z["ups_c"], int(meta["n_forced"])
+    floor = meta.get("floor")
+    return {"floor": None if floor is None else int(floor)}

@@ -1,24 +1,26 @@
 r"""
 The two-tier training loop (port of the notebook's training cell).
 
-Outer tier: the supervision window — the deterministic full-batch window for a
-special-only run, or a random window every ``adapt_every`` iterations when an
-Adam phase exists. Inner tier: the per-iteration ENGD (or Adam) step on the
-frozen window.
+Outer tier: every ``adapt_every`` iterations a new supervision window opens —
+RAR sweep or random/full-batch sampling — refreshing the fixed point sets and
+(under NTK weighting) the loss weights; the special optimizer's state restarts
+at each boundary so L-BFGS curvature memory never spans two windows. Inner
+tier: the lightweight per-iteration step on the frozen window.
 
-The loop is interrupt-safe (Ctrl-C retains the latest state), re-entrant on the
-same :class:`TrainerState` (``train`` continues from ``state.train_iter`` with
-the compiled steps cached, which is what lets the workflow stream a loss per
-iteration), and keeps the scalar history in memory keyed by group NAME.
+The loop is interrupt-safe (Ctrl-C retains the latest state and writes an
+interrupt checkpoint), resumable
+(Orbax full-resume keyed by the config hash), and logs scalars to TensorBoard
+plus an in-memory history keyed by group NAME.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import SpecialOpt
+from .config import SamplingDesign, SpecialOpt, WeightingDesign
 from .optimizers import phase_of
 from . import sampling as sampling_mod
 
@@ -44,6 +46,7 @@ class RunResult:
     comps: dict = field(default_factory=dict)      # group -> final loss component
     weights: dict = field(default_factory=dict)    # group -> final weight
     engd_last_eta: float | None = None
+    tb_logdir: str = ""
     hist: dict = field(default_factory=dict)
     error: str = ""
     extra: dict = field(default_factory=dict)      # diagnostics metrics (RMSE, png paths, ...)
@@ -63,8 +66,9 @@ def _fresh_hist(groups) -> dict:
     return h
 
 
-def init_trainer(bundle) -> TrainerState:
-    """Fresh trainer state for one built pipeline (no checkpoint resume in v1)."""
+def init_trainer(bundle, resume: bool = True) -> TrainerState:
+    """Fresh trainer state for one built pipeline. ``resume`` is accepted and ignored: a
+    job is not checkpointed (a worker restart loses the run), so there is nothing to resume."""
     import jax.numpy as jnp
     from jax import random
 
@@ -78,17 +82,62 @@ def init_trainer(bundle) -> TrainerState:
                         w=w, hist=_fresh_hist(resolved.groups), train_iter=train_iter)
 
 
+def init_trainer_from_params(bundle, params) -> TrainerState:
+    r"""
+    Fresh trainer state seeded from an *externally supplied* parameter set —
+    the transfer-learning/finetuning constructor.
+
+    Cross-mesh parameter transfer is explicit:
+    take the trained ``state.params`` of a source bundle and hand them here to
+    a target bundle whose architecture fields (``n_eig``, ``m_width``,
+    ``n_blocks``, ``mlp_hidden``, ``dim_out``) match, so the parameter shapes
+    agree exactly.
+
+    The returned state starts at ``train_iter = 0`` with a fresh history and
+    the target bundle's initial weights; the optimizer state is re-initialized
+    from the transferred parameters via ``steps.opt_init`` (which device-puts
+    and casts them to the master precision).
+    """
+    import jax.numpy as jnp
+    from jax import random
+
+    cfg, resolved, steps = bundle.cfg, bundle.resolved, bundle.steps
+    p, opt_state, phase = steps.opt_init(params)
+    w = jnp.asarray(resolved.initial_weights, jnp.float32)
+    key = random.fold_in(random.PRNGKey(cfg.seed + 1), 0)
+    return TrainerState(params=p, opt_state=opt_state, opt_phase=phase, key=key,
+                        w=w, hist=_fresh_hist(resolved.groups), train_iter=0)
+
+
 def _refresh(bundle, state: TrainerState, key):
-    """Open a new window: the deterministic full-batch window (special-only runs) or a
-    random one; the fixed weights pass through unchanged."""
-    cfg, resolved, env = bundle.cfg, bundle.resolved, bundle.env
+    """Open a new window: RAR sweep, or (full-batch/random) sampling + optional NTK reseed."""
+    import jax
+    from jax import random
+
+    cfg, resolved, env, steps = bundle.cfg, bundle.resolved, bundle.env, bundle.steps
+    p_eval = jax.device_put(steps.as_f32(state.params), env.repl)
+
+    if cfg.sampling is SamplingDesign.RAR:
+        return bundle.adapt_select(p_eval, state.w, key)
 
     if resolved.full_batch:
         win = state.win if state.win is not None else sampling_mod.full_batch_window(
             cfg, bundle.case, resolved, env)
     else:
         win = sampling_mod.random_window(cfg, bundle.case, resolved, env, key)
-    return win, state.w
+
+    w_new = state.w
+    if cfg.weighting is WeightingDesign.NTK and bundle.ntk_weights is not None:
+        from .weighting import ntk_update, probe_window
+        import jax.numpy as jnp
+
+        k1, k2 = random.split(random.fold_in(key, 1))
+        n_probe = min(cfg.n_ntk_fem if cfg.ntk_trace == "shrink"
+                      else resolved.ntk_batches.get("pde", 1), bundle.case.n_nodes)
+        fem_nodes = random.choice(k1, bundle.case.n_nodes, (n_probe,), replace=False)
+        lam, _ = bundle.ntk_weights(p_eval, k2, probe_window(cfg, resolved, win), fem_nodes)
+        w_new = ntk_update(state.w, lam, cfg, resolved.groups)
+    return win, w_new
 
 
 def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int = 100,
@@ -101,14 +150,14 @@ def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int
     appended to ``hist[f"eval_{name}"]`` alongside the loss traces, e.g. a
     periodic time-mean RMSE on one or more mesh cases during training. The
     hooks receive the master parameters (cast internally by consumers such as
-    :func:`pinnlab.diagnostics.predict_cells`).
+    :func:`modules.diagnostics.predict_cells`).
 
     Every history-log step also appends the elapsed wall-clock seconds to
     ``hist["wall_s"]`` (continued from the last recorded value when ``train``
     is called again on the same state, so the timeline stays monotone across
     resumed segments), and — when ``cfg.engd.track_deff`` is set — the effective
     dimension :math:`d_{\mathrm{eff}}` of the damped Gauss-Newton system to
-    ``hist["engd_d_eff"]`` (see :func:`pinnlab.engd.effective_dim`). That key is
+    ``hist["engd_d_eff"]`` (see :func:`modules.engd.effective_dim`). That key is
     absent entirely on untracked runs, so its presence means "measured" rather
     than "measured as NaN".
 
@@ -132,15 +181,11 @@ def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int
 
     - :math:`\eta^\ast`: the accepted line-search step size (``EngdAux.eta``).
     - :math:`\mathcal{S} = \{0\} \cup \{2^{-j} : j = 0, \dots, 30\}`: the
-      geometric line-search grid of :func:`pinnlab.engd.grid_line_search`.
+      geometric line-search grid of :func:`modules.engd.grid_line_search`.
     - :math:`\psi`: the damped natural-gradient direction.
 
-    Checkpoints go to the bundle's Orbax manager every ``cfg.ckpt_every``
-    iterations and, additionally, on ``KeyboardInterrupt`` (``status =
-    "interrupted"``) so that a run stopped between two cadence saves resumes
-    from the interrupted iteration rather than from the last multiple of
-    ``ckpt_every``. The interrupt save is skipped when no iteration completed
-    since ``train`` was entered.
+    A ``KeyboardInterrupt`` ends the loop with ``status = "interrupted"`` and the latest
+    state retained.
     """
     import jax
     import numpy as onp
@@ -148,10 +193,11 @@ def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int
 
     cfg, resolved, steps = bundle.cfg, bundle.resolved, bundle.steps
     groups = resolved.groups
+    writer = bundle.writer
     hist = state.hist
     status = "completed"
     last_eta = None
-    static_window = resolved.full_batch
+    static_window = resolved.full_batch and cfg.weighting is not WeightingDesign.NTK
 
     t_start = time.perf_counter()
     wall_prev = hist.get("wall_s") or [0.0]
@@ -184,6 +230,8 @@ def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int
                 jax.block_until_ready(state.w)
                 refresh_ms = 1e3 * (time.perf_counter() - t0)
                 hist["refresh_ms"].append(refresh_ms)
+                if writer is not None:
+                    writer.add_scalar("adapt/refresh_ms", refresh_ms, it)
                 # new window => restart the special state (curvature memory / nothing for ENGD),
                 # unless the special optimizer accumulates ACROSS windows on purpose (SPRING)
                 if (state.opt_phase == "special" and steps.special_init is not None
@@ -229,6 +277,22 @@ def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int
                     for h_name, h_fn in eval_hooks.items():
                         h_val = float(h_fn(state.params))
                         hist.setdefault(f"eval_{h_name}", []).append(h_val)
+                        if writer is not None:
+                            writer.add_scalar(f"eval/{h_name}", h_val, it)
+                if writer is not None:
+                    writer.add_scalar("loss/total", val_h, it)
+                    for g, v in zip(groups, comps_h):
+                        writer.add_scalar(f"loss/{g}", float(v), it)
+                    for g, wv in zip(groups, w_h):
+                        writer.add_scalar(f"ntk_weight/{g}", float(wv), it)
+                    if aux is not None and hasattr(aux, "_fields"):
+                        for f_name in aux._fields:
+                            # non-finite aux fields are sentinels, not measurements: d_eff is
+                            # nan unless engd.track_deff is set. Logging them makes tensorboardX
+                            # warn once per step and writes a nan series to the event file.
+                            f_val = float(getattr(aux, f_name))
+                            if math.isfinite(f_val):
+                                writer.add_scalar(f"engd/{f_name}", f_val, it)
                 comp_str = " ".join(f"{g} {v:.10e}" for g, v in zip(groups, comps_h))
                 print(f"it {it:5d} | J {val_h:.4e} | {comp_str} | "
                       f"w {onp.array2string(w_h, precision=4)}")
@@ -248,6 +312,12 @@ def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int
     final_w = {g: hist[f"w_{g}"][-1] for g in groups if hist[f"w_{g}"]}
     print(f"training {status}: {cfg.residual_design.value}/{cfg.backprop_design.value if cfg.backprop_design else '-'}, "
           f"mesh {resolved.mesh_shape}, {cfg.sampling.value} sampling, at iteration {state.train_iter}.")
+    if writer is not None:
+        try:
+            writer.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
     return RunResult(
         status=status,
         iterations=int(state.train_iter),
@@ -256,5 +326,6 @@ def train(bundle, state: TrainerState, n_iter: int | None = None, log_every: int
         comps=final_comps,
         weights=final_w,
         engd_last_eta=last_eta,
+        tb_logdir=getattr(bundle, "tb_logdir", ""),
         hist=hist,
     )

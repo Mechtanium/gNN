@@ -1,82 +1,80 @@
 # gNN — a PERD workflow
 
-A physics-informed neural network for **reservoir history matching**. The black-oil balances of a field are enforced through a spectral (Laplace-eigenfunction) residual on the reservoir's own hexahedral grid while the simulator's cell states and the wells' observed rates supervise the network. The only input is one Eclipse deck; from it the workflow runs the reference simulation (OPM Flow), extracts the grid, rock, cell states and wells through ResInsight, builds the finite-element operators and the eigenbasis, and trains — streaming the losses and the predicted cell states to the app page as it goes.
+Build a reservoir model, hand it to the simulator, and run it through a physics-informed neural network: match its whole history, match part of it and forecast the rest, or invert a field's well record for the properties nobody measured. gNN is a PERD app laid out like a desktop modelling package: a toolbar of project commands and jobs, an explorer of the model, tabs for each stage of the work.
 
-It is the second PERD app after [DCA_PINN](https://github.com/Mechtanium/DCA_PINN) and the one that exercises the heavy parts of the platform: a build-time `setup.sh`, an input stream for the deck, multi-megabyte output items, a 3-D page element and a GPU compute class. The training code is a trimmed, bit-identical extraction of the research notebook `PINN-Lab.ipynb`'s gold-standard configuration (see [tests/parity](tests/parity/README.md)).
+The network is the composition the research campaign of `PINN-Lab` chose for every reservoir it was tried on (`AUTOPILOT`, [modules/autopilot.py](modules/autopilot.py)): a deep Galerkin network on Laplace-eigenfunction inputs of the reservoir's own grid, the black-oil balances enforced through a spectral residual, trained by energy natural-gradient descent. Nothing about it is a setting; each work path fixes only what the simulator's run is observed through and what closes the equations.
 
-## What the workflow does
+![The history match of a model built in the app](docs/page.png)
 
-```python
-@workflow.bi_di
-async def train(
-    chunks: WorkflowStreamInput[bytes],    # the deck, in ≤ 1 MiB pieces
-    deck_name: str = "deck.DATA",
-    preset: str = "gold",                  # "gold" (the notebook config) | "quick" (deck-sized, CPU)
-    n_iter: int = 20000, seed: int = 30,
-    m_width: int = 0, n_blocks: int = 0, n_eig: int = 0,   # 0 = the preset's choice
-    log_every: int = 1, snapshot_every: int = 50, n_snapshots: int = 8,
-) -> WorkflowStreamOutput[str, int, float, float, float, float, float, str]:
-    # one item = (kind, iteration, total, pde, ic, data, well, payload_json)
-```
+## The app
 
-Every output item has a `kind`:
+| Tab | What it is for |
+|---|---|
+| **Model** | A model is either **designed** in the app or **imported** as a deck. A design is edited section by section: the grid (columns, rows and layers; a structural top — flat, tilted, a dome or an anticline; faults drawn on a map, with their throw and transmissibility; inactive cells painted or boxed), property recipes (a constant, a value per layer, a trend, a correlated random field, a porosity–permeability transform, a scaled copy, a value in a box, in painted cells or in a region), fluids from correlations, rock–fluid functions, the initial equilibrium. An imported deck is edited keyword by keyword, with table editors for `EQUIL`, `SWOF`, `SGOF`, `PVDG` and the other tables; every file it does not change is written back byte for byte. The 3-D view shows the model as OPM Flow builds it. |
+| **Wells & schedule** | The wells and their paths (vertical, deviated or horizontal, placed or drawn on a permeability map), the controls over time, the history \| prediction boundary, and the **observed record** — the field's measured bottom-hole pressures and rates, typed in, pasted from a spreadsheet, or imported from a CSV or an Eclipse summary. |
+| **Simulation** | OPM Flow's findings about the deck, the simulated cell states in 3-D, every well's record, and the deck itself. |
+| **History match** | Work path 1: the network learns the simulator's run of the whole history. |
+| **Forecast** | Work path 2: the network learns the run up to the boundary and carries the field past it. |
+| **Inversion** | Work path 3: the field record is inverted for the model's uncertain properties. |
 
-| kind | when | payload |
-|---|---|---|
-| `stage` | as the pipeline moves: simulate → prep → resolve → build → train → done | `{"stage", "message"}`; the `total` slot carries the fraction done |
-| `grid` | once, before the first optimizer step (in parts if the field is large) | corners of every cell (float32, VTK order), i-j-k addresses, the snapshot times, the fixed colour range of every field, the wells' perforated cells |
-| `loss` | every `log_every` iterations | the five losses ride in the numeric slots; `{"wall_s", "eta"}` |
-| `state` | at iteration 0, every `snapshot_every` iterations and at the end, one per snapshot time | `S_w, S_o, S_g, p_o, p_w, p_g, R_so` for every cell (float16, clipped into the fixed ranges) |
-| `metrics` | at the end | pressure and saturation RMSEs against the simulator |
-| `error` | instead of a crash | `{"message"}` |
+The toolbar's jobs:
 
-The two presets are in [modules/presets.py](modules/presets.py). **Gold** is the notebook's configuration (`n_eig=5`, DGM `16×2`, 20 000 ENGD iterations, about 20 s per iteration on a T4). **Quick** keeps every component and physics setting but lets the sizes follow the deck: the eigenbasis width from the automatic addressability floor and the network width and depth from a parameter target of 800, so a smoke run finishes in minutes on a CPU workstation (SPE-2: about 2 s per iteration on two CPU cores after a cold start of roughly four minutes — 60 s of Flow, 25 s of ResInsight, 55 s of eigensolve and two minutes of XLA compilation; every one of those is cached per deck under the work directory, so a second run on the same deck starts training in about two minutes).
+- **Check** — OPM Flow reads the deck tree and builds the model, then stops: its warnings and errors (with the file and line they concern), the grid with inactive cells and pore-volume cuts applied, the wells' perforations, and the static properties. Seconds, even for Norne.
+- **Simulate** — OPM Flow runs the model; its report steps stream as it goes.
+- **History match**, **Match + forecast**, **Invert** — the three work paths below.
 
-## The app page
+Every job receives the whole project as one bundle, so the deck, the boundary, the field record and the prior always travel together, and a second job on the same model reuses the simulation, the extraction, the eigenbasis and the compiled steps.
 
-[page.py](page.py) is laid out like ResInsight: the left pane holds the deck upload, the preset, the iteration count, the seed, the snapshot cadence `N` and the **Train** button, then the view controls (field, snapshot time, Z scale and the i/j/k slice ranges); the right pane shows the reservoir as solid hexahedral cells coloured on a fixed legend on top, and the five losses on a log-Y chart with the run's metrics below. Slicing keeps the interior in view: cutting at `k = 7` removes the layers below and shows the cut surface coloured by those cells' values. The legend of each field is the simulator's range widened by 1.5 standard deviations on each side; predictions beyond it are clipped, so the colours never rescale mid-run.
+## The three work paths
 
-![The page after a quick run on SPE-2](docs/page.png)
+| | History match | Match + forecast | Inversion |
+|---|---|---|---|
+| learns from | the simulator's cell states at every report step and the wells' records | the same, up to the history \| prediction boundary | the cell states of 24 simulator runs of the model at sampled properties |
+| well model | closed form; the well rows at weight 0.1 | predicted flowing pressure with control rows and the three-state switch (rate target, pressure limit, or shut) | closed form |
+| closes the equations with | the observed states | phase equilibrium and whole-reservoir material balance where no state is observed | the observed states of every run |
+| reports | the field and the wells against the simulator | the same, the forecast scored against the simulator's own run past the boundary | the posterior of each property, with the family's own error on 8 held-out runs added to the record's noise, verified by one more simulator run |
 
-## Publishing it on PERD
+**What the inversion inverts** follows from the model: the vertical-to-horizontal permeability ratio always, the water–oil contact when the deck has water and the contact lies within the reservoir, the gas–oil contact likewise. The prior's widths are set on the Inversion tab. The runs and the trained family are kept, so inverting another record of the same model only searches again.
 
-Push this repository to GitHub, sign in on the PERD website, open **Store → Publish from GitHub**, paste the URL and choose the workflow id. The image build runs [setup.sh](setup.sh) as root before the Python installs — that script is where every ResInsight detail lives (the Debian libraries the binary needs, the pinned nightly zip verified by SHA-256, the `xvfb` wrapper `rips` launches, a writable `HOME` for the non-root user); the platform knows nothing about ResInsight. The image is about 5 GB (JAX CUDA, ResInsight, OPM Flow), so give the build a 3600 s timeout and an 8-vCPU machine. The repository declares the **GPU T4** compute class in [perd.toml](perd.toml) — the build reads it and every workstation running this workflow is sized from it, so the launch dialog shows the class rather than asking for it. Launch the app with a three-day lease for gold runs; the quick preset runs on the same machine in minutes.
+**What the methods can do** is what the research found: matched on cell states, the network reconstructs a reservoir closely; past the data, its physics carries depletion for about a year before the forecast drifts; from well records alone a field is not determined, which is why the inversion teaches a family of simulated reservoirs instead of fitting one.
 
-The ResInsight zip is a release asset of this repository (`resinsight-2026.07`), never a git object; `setup.sh` falls back to the nightly link if the asset is missing and refuses anything whose checksum differs.
+## Building and publishing
 
-## Running it locally
+Publish the repository from **Store › Publish from GitHub** as before. The image build runs [setup.sh](setup.sh) (ResInsight under a virtual display), then [requirements.txt](requirements.txt) (JAX with CUDA 12, OPM Flow as a wheel). The page needs **perd-worker 0.9** — the toolbar, tabs, data editors and maps it is built from arrived in that release — so publish once the platform's 0.9 release is out. The repository declares the **GPU T4** class in [perd.toml](perd.toml); give the build a 3600 s timeout and an 8-vCPU machine, and the workstation a three-day lease for field-scale models.
+
+Cost on one T4, from the research campaign: a history match of a few thousand cells, minutes to an hour; of Norne (44,431 cells), about 36 hours for 600 iterations. A family for the inversion is 32 simulator runs (in parallel on the CPU cores) and one training of the network with property channels.
+
+## Running it on this machine
 
 ```bash
-pip install -r requirements.txt 'perd-worker[page]'
-export RESINSIGHT_EXECUTABLE=/opt/ResInsight/bin/resinsight-xvfb   # or a ResInsight nightly on this machine
-python -m perd_worker.serve --module workflow --name delta_pinn --port 50051
-python -c "from perdlit._script import check_page; print(check_page('page', 'workflow'))"
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt   # or jax[oneapi]==0.12.0.1 / plain jax for an Intel GPU / a CPU
+.venv/bin/pip install 'perd-worker[page]>=0.9' perd-orchestrator
+export RESINSIGHT_EXECUTABLE=/opt/ResInsight/bin/resinsight-xvfb   # a wrapper running ResInsight under xvfb-run
+.venv/bin/python tools/local_app.py --port 8501
 ```
 
-The work directory is `$DELTA_PINN_WORK` (default `/tmp/delta_pinn`), one folder per deck: the deck, Flow's results, the preprocessing cache and the spectral cache.
+Then open <http://127.0.0.1:8501/>. [tools/local_app.py](tools/local_app.py) runs a worker, an orchestrator and the page in one process on loopback — the shape a workstation has, without the control plane. Models' work directories go to `$GNN_WORK` (default `/tmp/gnn`), one per deck tree.
 
 ## Tests
 
 ```bash
-pytest tests -q                                   # message encoding, OPM Flow on SPE1 (twice in one process), every referenced name defined
-RESINSIGHT_EXECUTABLE=… pytest tests -q -m slow   # SPE1 deck → Flow → ResInsight → 5 quick iterations (DELTA_PINN_DECK= for another deck)
-DECK=… RESINSIGHT_LOCAL_ZIP=… tests/test_resinsight_container.sh    # the image recipe in docker, as uid 10001
+JAX_PLATFORMS=cpu .venv/bin/python -m pytest tests -q            # encoding, bundles, builder, deck round trips, names
+RESINSIGHT_EXECUTABLE=… .venv/bin/python -m pytest tests -q -m slow   # every work path end to end on SPE1, with a test budget
 ```
 
-`tests/data` vendors two open decks: SPE1CASE1 (OPM's, ODbL; 300 cells, `DATES`/`WCONINJE` blocks) and SPE-2 (9 375 cells). They cover different parser branches — a helper the trim had deleted (`_parse_wconinje_row`) was invisible on SPE-2 and fatal on SPE1, which is what `tests/test_static.py` now guards.
-
-[tests/parity](tests/parity) holds the developer scripts that prove the extracted pipeline is bit-identical to the research notebook's.
+[tests/parity](tests/parity) holds the developer scripts that prove the history-match and forecast paths train exactly as the research code (`pinnlab.config.autopilot`) does: identical losses at every iteration on SPE1.
 
 ## Layout
 
-- `workflow.py` — the `train` operation (light imports at the top; the heavy ones inside).
-- `page.py` — the perdlit page.
-- `modules/` — the training pipeline: `presets`, `config`, `pipeline`, `training`, `engd`, `spectral`, `wells`, … and the streaming spine `stream.py` / `frames.py`; `modules/simulate.py` (OPM Flow) and `modules/prep.py` (ResInsight through `rips`).
-- `modules/utils/` — the mesh, the extractor (rips backend), the preprocessing cache, the black-oil closures, the FEM assembly and the eigenbasis.
-- `field/` — the vendored deck-table parser, trimmed to what the extractor needs.
-- `setup.sh`, `requirements.txt` — the image recipe.
-- `perd.toml` — what the workflow asks of the platform: `[compute] class = "gpu_t4"`.
+- `workflow.py` — the five operations; light imports only.
+- `page.py`, `ui/` — the app: the shell, and one module per group of tabs.
+- `builder/` — the model: the deck as a lossless document (`deck.py`), records and tables (`records.py`), designs and the decks generated from them (`design.py`, `correlations.py`, `units.py`), the project file (`project.py`), the deck variants of an inversion (`variants.py`).
+- `modules/` — the numerics, extracted from `PINN-Lab`: `autopilot.py` (the composition and the three paths), `flows/` (check, simulate, and the three work paths as message streams), `frames.py` (the messages), the pipeline, the residuals, ENGD, the family; `simulate.py` (OPM Flow), `prep.py` (ResInsight).
+- `templates/` — the sample decks offered under **New**.
+- `field/` — the vendored deck-table parser.
+- `setup.sh`, `requirements.txt`, `perd.toml` — the image recipe and what the workflow asks of the platform.
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](LICENSE). The sample decks are OPM's, under the Open Database License.

@@ -6,3 +6,4 @@ __pycache__/
 *.npz
 *.zip
 .pytest_cache/
+.venv/

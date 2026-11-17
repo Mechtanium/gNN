@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-FILES = sorted((ROOT / "modules").rglob("*.py")) + [ROOT / "workflow.py", ROOT / "page.py"]
+FILES = (sorted((ROOT / "modules").rglob("*.py")) + sorted((ROOT / "builder").rglob("*.py"))
+         + sorted((ROOT / "ui").rglob("*.py")) + sorted((ROOT / "tools").rglob("*.py"))
+         + [ROOT / "workflow.py", ROOT / "page.py"])
 BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__", "__path__"}
 
 

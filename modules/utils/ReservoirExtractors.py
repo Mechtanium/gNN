@@ -142,7 +142,16 @@ def _require_result_file(
     raise MissingResultFileError(message)
 
 
-def _find_case_file(directories: list[Path], preferred_stems: list[str], suffix: str) -> Path | None:
+def _find_case_file(
+    directories: list[Path], preferred_stems: list[str], suffix: str, fallback: bool = False
+) -> Path | None:
+    """The file ``<stem><suffix>`` of the first preferred stem found in ``directories``.
+
+    With ``fallback``, a deck whose run wrote its files under another name is still found:
+    the one file with ``suffix`` directly in a searched folder. Subfolders are never
+    searched — they hold the runs of other decks (derived decks beside their parent), whose
+    files must not be taken for the parent's — and an ambiguous folder yields nothing.
+    """
     for directory in directories:
         if not directory.exists():
             continue
@@ -151,14 +160,15 @@ def _find_case_file(directories: list[Path], preferred_stems: list[str], suffix:
                 existing = _existing_path(candidate)
                 if existing is not None:
                     return existing
-    upper_suffix = suffix.upper()
-    lower_suffix = suffix.lower()
+    if not fallback:
+        return None
     for directory in directories:
         if not directory.exists():
             continue
-        for candidate in sorted(directory.rglob(f"*{upper_suffix}")) + sorted(directory.rglob(f"*{lower_suffix}")):
-            if candidate.is_file():
-                return candidate.resolve()
+        found = {p.resolve() for pattern in (f"*{suffix.upper()}", f"*{suffix.lower()}")
+                 for p in directory.glob(pattern) if p.is_file()}
+        if len(found) == 1:
+            return found.pop()
     return None
 
 
@@ -510,7 +520,7 @@ def resolve_reservoir_source(model_path: str | Path) -> ReservoirSource:
     if results_dir is not None:
         search_dirs.append(results_dir)
 
-    egrid_path = _find_case_file(search_dirs, preferred_stems, ".EGRID")
+    egrid_path = _find_case_file(search_dirs, preferred_stems, ".EGRID", fallback=True)
     if egrid_path is None:
         raise MissingResultFileError(
             f"Could not resolve an .EGRID grid companion for deck '{data_path}'. "
@@ -1035,6 +1045,196 @@ def deck_three_phase_oil_model(model_path: Path | str) -> str:
             if token == "STONE2":
                 found = "stone2"
     return found
+
+
+def deck_pvto_undersaturated(model_path: Path | str) -> dict | None:
+    r"""
+    The undersaturated branches of the deck's live-oil table (``PVTO``, first PVT region),
+    reduced to one slope per saturated node in each of the two quantities the simulator
+    interpolates linearly along a branch, the inverse FVF and the inverse mobility product,
+
+    .. math::
+
+        \beta_{B,i} \;=\; \frac{1/B_{o,i}(p_i^{\max}) - 1/B_{o,i}^{\mathrm{sat}}}{p_{i}^{\max} - p_{b,i}},
+        \qquad
+        \beta_{B\mu,i} \;=\; \frac{1/(B_{o,i}\mu_{o,i})(p_i^{\max}) - 1/(B_{o,i}^{\mathrm{sat}}\mu_{o,i}^{\mathrm{sat}})}{p_{i}^{\max} - p_{b,i}}
+
+    where:
+    - :math:`p_{b,i}, B_{o,i}^{\mathrm{sat}}, \mu_{o,i}^{\mathrm{sat}}`: the saturated record of node :math:`i` (solution GOR :math:`R_{s,i}`), and :math:`p_i^{\max}` the highest pressure of its undersaturated rows, at which :math:`B_{o,i}` and :math:`\mu_{o,i}` are read.
+    - a node without undersaturated rows takes the values of the nearest node above it that has them (below it as the last resort), the way the simulator extends a missing branch.
+
+    The main deck file and its INCLUDEs are scanned as text. Returns
+    ``{"pvto_us_rs", "pvto_us_dinvb", "pvto_us_dinvbmu"}`` (arrays over the nodes), or ``None``
+    when the deck has no PVTO or no node carries an undersaturated branch.
+    """
+    root = Path(model_path)
+    tokens: list[str] = []
+    active = False
+    for path in [root] + _collect_deck_include_paths(root):
+        try:
+            text = Path(path).read_text(errors="ignore")
+        except OSError:
+            continue
+        for raw_line in text.splitlines():
+            line = _strip_schedule_comment(raw_line).strip()
+            if not line:
+                continue
+            word = line.split()[0].upper()
+            if not active:
+                if word == "PVTO":
+                    active = True
+                continue
+            if word.isalpha() and word not in ("E",):
+                active = False                          # next keyword ends the table
+                break
+            tokens += line.replace("/", " / ").split()
+        if tokens and not active:
+            break
+    records: list[list[float]] = [[]]
+    for tok in tokens:
+        if tok == "/":
+            if not records[-1]:
+                break                                   # empty record ends the region
+            records.append([])
+        else:
+            records[-1].append(float(tok))
+    nodes = []
+    for rec in (r for r in records if r):
+        if len(rec) < 4:
+            continue
+        rs, pb, b_sat, mu_sat = rec[:4]
+        rows = rec[4:]
+        c_b = c_mu = None
+        if len(rows) >= 3:
+            p_max, b_max, mu_max = rows[-3:]
+            if p_max > pb:
+                c_b = (1.0 / b_max - 1.0 / b_sat) / (p_max - pb)
+                c_mu = (1.0 / (b_max * mu_max) - 1.0 / (b_sat * mu_sat)) / (p_max - pb)
+        nodes.append((rs, c_b, c_mu))
+    have = [i for i, n in enumerate(nodes) if n[1] is not None]
+    if not have:
+        return None
+    rs_out, cb_out, cmu_out = [], [], []
+    for i, (rs, c_b, c_mu) in enumerate(nodes):
+        if c_b is None:
+            above = [j for j in have if j > i]
+            src = nodes[above[0] if above else have[-1]]
+            c_b, c_mu = src[1], src[2]
+        rs_out.append(rs)
+        cb_out.append(c_b)
+        cmu_out.append(c_mu)
+    return {"pvto_us_rs": np.asarray(rs_out), "pvto_us_dinvb": np.asarray(cb_out),
+            "pvto_us_dinvbmu": np.asarray(cmu_out)}
+
+
+def deck_keyword_records(model_path: Path | str, keyword: str) -> list[list[str | None]]:
+    """The records of every occurrence of ``keyword`` in the deck (main file and INCLUDEs, in
+    deck order): each record a list of fields up to its ``/``, quotes stripped, a defaulted
+    field (``1*``, ``n*``) expanded to ``None`` entries and a repeat (``n*value``) to ``n``
+    copies. A keyword's record list ends at an empty record or at the next keyword."""
+    import shlex
+
+    root = Path(model_path)
+    records: list[list[str | None]] = []
+    current: list[str | None] | None = None
+    for path in [root] + _collect_deck_include_paths(root):
+        try:
+            text = Path(path).read_text(errors="ignore")
+        except OSError:
+            continue
+        for raw_line in text.splitlines():
+            line = _strip_schedule_comment(raw_line).strip()
+            if not line:
+                continue
+            if current is None:
+                if line.split()[0].upper() == keyword.upper():
+                    current = []
+                continue
+            if not current and line.split()[0].isalpha() and line.split()[0].upper() == line.split()[0] \
+                    and not line.startswith("'") and len(line.split()[0]) >= 4:
+                current = None                       # the next keyword ends the list
+                if line.split()[0].upper() == keyword.upper():
+                    current = []
+                continue
+            lexer = shlex.shlex(line.replace("/", " / "), posix=True)
+            lexer.whitespace_split = True
+            for tok in lexer:
+                if tok == "/":
+                    if not current:
+                        current = None               # an empty record ends the list
+                        break
+                    records.append(current)
+                    current = []
+                    continue
+                if "*" in tok:
+                    count, _, value = tok.partition("*")
+                    n = int(count) if count else 1
+                    current.extend([value] * n if value else [None] * n)
+                else:
+                    current.append(tok)
+    return records
+
+
+def deck_drsdt(model_path: Path | str) -> float | None:
+    r"""
+    The deck's limit on the rate at which free gas re-dissolves into oil (``DRSDT``), in the
+    deck's units of solution gas–oil ratio per day, or ``None`` when the deck sets none.
+
+    The simulator lets the dissolved gas–oil ratio :math:`R_s` rise at most at this rate,
+
+    .. math::
+
+        \frac{\partial R_s}{\partial t} \;\le\; \mathrm{DRSDT},
+
+    so ``0`` forbids re-dissolution altogether (gas once released stays free, and free gas
+    meeting undersaturated oil does not dissolve), while a deck without the keyword lets the
+    oil take up free gas instantly, back to the saturated ratio :math:`R_s^{\mathrm{sat}}(p)`.
+    The first record of the first occurrence counts; the main file and its INCLUDEs are
+    scanned (:func:`deck_keyword_records`).
+    """
+    for rec in deck_keyword_records(model_path, "DRSDT"):
+        if rec and rec[0] is not None:
+            return float(rec[0])
+    return None
+
+
+def deck_fetkovich_aquifers(model_path: Path | str) -> list[dict]:
+    r"""
+    The deck's Fetkovich aquifers (``AQUFETP``) with their grid connections (``AQUANCON``).
+
+    Each aquifer is a pressure-volume tank of initial water volume :math:`V_w`, total
+    compressibility :math:`c_t` and productivity index :math:`J`, connected to the faces of
+    the reservoir cells its ``AQUANCON`` records list; the simulator (and
+    :mod:`pinnlab.aquifer`) let water flow across them at
+    :math:`q_a = J\,\alpha_c\,\bigl(p_a - p_c + \gamma_w (z_c - z_d)\bigr)` per connection.
+
+    Returns one dict per aquifer — ``id``, ``datum`` (ft), ``p0`` (psia, ``None`` when the
+    deck leaves it to equilibration), ``vw0`` (stb), ``ct`` (1/psi), ``pi`` (stb/d/psi) and
+    ``connections``: ``(i1, i2, j1, j2, k1, k2, face, coeff, mult, internal)`` with 1-based
+    indices, the face as written (``I-`` … ``K+``), ``coeff`` ``None`` where the face area
+    applies, and ``internal`` whether faces between active cells may connect. The
+    values are in the deck's units; :func:`modules.utils.unit_conversion.convert_aquifers` brings a
+    METRIC deck to FIELD.
+    """
+    def num(x, default=None):
+        return default if x is None else float(x)
+
+    out = {}
+    for rec in deck_keyword_records(model_path, "AQUFETP"):
+        rec = rec + [None] * (9 - len(rec))
+        aid = int(rec[0])
+        out[aid] = {"id": aid, "datum": num(rec[1]), "p0": num(rec[2]), "vw0": num(rec[3]),
+                    "ct": num(rec[4]), "pi": num(rec[5]), "connections": []}
+    for rec in deck_keyword_records(model_path, "AQUANCON"):
+        rec = rec + [None] * (11 - len(rec))
+        aid = int(rec[0])
+        if aid not in out:
+            continue
+        i1, i2, j1, j2, k1, k2 = (int(v) for v in rec[1:7])
+        out[aid]["connections"].append(
+            (i1, i2, j1, j2, k1, k2, str(rec[7]).upper(), num(rec[8]), num(rec[9], 1.0),
+             str(rec[10] or "NO").upper().startswith("Y")))
+    return [out[k] for k in sorted(out)]
 
 
 def _collect_deck_include_paths(model_path: Path) -> list[Path]:
@@ -1825,10 +2025,9 @@ def build_reservoir_preprocessing_artifacts(
                 try:
                     stage_start = pd.Timestamp.now()
                     blackoil_tables = build_blackoil_table_pack(aux_field)
-                    # STONE1 / STONE2 is a PROPS keyword the table loader does not see:
-                    # a deck without one keeps Stone II (the closures' historical model)
-                    model = deck_three_phase_oil_model(source.data_path)
-                    blackoil_tables["kro_model"] = "stone1" if model == "stone1" else "stone2"
+                    # STONE1 / STONE2 is a PROPS keyword the table loader does not see;
+                    # a deck naming neither runs the default segregated model
+                    blackoil_tables["kro_model"] = deck_three_phase_oil_model(source.data_path)
                     timings["blackoil_tables"] = float((pd.Timestamp.now() - stage_start).total_seconds())
                 except Exception:
                     if not allow_missing_blackoil_tables:

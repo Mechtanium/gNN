@@ -26,10 +26,17 @@ except ImportError:  # pragma: no cover - fallback for minimal environments
 
     joblib = _JoblibCompat()
 
-from modules.utils.ReservoirExtractors import build_reservoir_preprocessing_artifacts
+from modules.utils.portable_paths import local_path, local_signature, portable_path, portable_signature
+from modules.utils.ReservoirExtractors import build_reservoir_preprocessing_artifacts, resolve_reservoir_source
 
 
 PREP_CACHE_VERSION = 2  # v2: artifacts normalized to FIELD units at extraction (unit_conversion)
+# Revision of the extraction code that writes the cache. A cache recorded under an older
+# revision still loads (the layout is unchanged) but is reported stale, so it is rebuilt the
+# next time Prep-Reservoir.ipynb or a campaign prep job runs. Bump on any change to what the
+# extraction computes; caches written before the field existed count as revision 1.
+# r2: well observations matched to report dates within the summary's float32 time rounding.
+PREP_CODE_REVISION = 2
 PREP_ARTIFACTS_FILENAME = "reservoir_preprocessing_artifacts.joblib"
 PREP_METADATA_FILENAME = "reservoir_preprocessing_metadata.json"
 
@@ -96,13 +103,19 @@ def preprocessing_cache_stale_reasons(cache_dir: str | Path) -> list[str]:
         metadata = load_preprocessing_metadata(cache_dir)
     except (FileNotFoundError, ValueError):
         return []
+    reasons = []
+    revision = int(metadata.get("code_revision", 1))
+    if revision < PREP_CODE_REVISION:
+        reasons.append(f"written by extraction code revision {revision}, the current one is "
+                       f"{PREP_CODE_REVISION}")
     recorded = metadata.get("source_signature")
     if not recorded:
-        return []
+        return reasons
     current = source_signature(metadata["model_path"])
-    return [f"{role} ({Path(current.get(role, recorded.get(role, {})).get('path', role)).name}) "
-            f"changed on disk after the cache was built"
-            for role in stale_source_files(recorded, current)]
+    return reasons + [
+        f"{role} ({Path(current.get(role, recorded.get(role, {})).get('path', role)).name}) "
+        f"changed on disk after the cache was built"
+        for role in stale_source_files(recorded, current)]
 
 
 def _json_ready(value: Any) -> Any:
@@ -149,23 +162,37 @@ def save_preprocessing_artifacts(
     artifacts,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    r"""
+    Write the artifacts and their metadata to ``cache_dir``.
+
+    Paths in the metadata are stored in the home-relative form of
+    :func:`modules.utils.portable_paths.portable_path`, so the cache does not depend on the account
+    that built it; :func:`load_preprocessing_metadata` expands them again.
+    """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifacts, preprocessing_artifacts_path(cache_dir))
     metadata = {
         "cache_version": PREP_CACHE_VERSION,
-        "model_path": str(Path(artifacts.source.data_path).resolve()),
-        "cache_dir": str(cache_dir.resolve()),
+        "code_revision": PREP_CODE_REVISION,
+        "model_path": portable_path(Path(artifacts.source.data_path).resolve()),
+        "cache_dir": portable_path(cache_dir.resolve()),
         "artifacts_file": PREP_ARTIFACTS_FILENAME,
         "config": _json_ready(config or {}),
         "summary": _json_ready(_artifact_summary(artifacts)),
-        "source_signature": _json_ready(source_signature(artifacts.source.data_path)),
+        "source_signature": portable_signature(_json_ready(source_signature(artifacts.source.data_path))),
     }
     preprocessing_metadata_path(cache_dir).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     return metadata
 
 
 def load_preprocessing_metadata(cache_dir: str | Path) -> dict[str, Any]:
+    r"""
+    Read a cache's metadata, with its stored paths expanded for this account.
+
+    Every reader of the metadata's paths goes through here, so only the file on disk holds
+    ``~``; metadata written with absolute paths is returned as it stands.
+    """
     path = preprocessing_metadata_path(cache_dir)
     if not path.exists():
         raise FileNotFoundError(f"Missing reservoir preprocessing metadata: {path}")
@@ -175,7 +202,29 @@ def load_preprocessing_metadata(cache_dir: str | Path) -> dict[str, Any]:
             f"Reservoir preprocessing cache version mismatch: expected {PREP_CACHE_VERSION}, "
             f"found {metadata.get('cache_version')}"
         )
+    for key in ("model_path", "cache_dir"):
+        if key in metadata:
+            metadata[key] = local_path(metadata[key])
+    if metadata.get("source_signature"):
+        metadata["source_signature"] = local_signature(metadata["source_signature"])
     return metadata
+
+
+def _rebind_source(artifacts, model_path: str):
+    r"""
+    Point a loaded artifact's ``source`` at ``model_path`` when it recorded another location.
+
+    The pickled source keeps the absolute paths of the account that built the cache, which
+    do not exist under another home. The recorded source stays when the deck or its grid
+    is not found here, since the cached arrays are still usable without them.
+    """
+    source = getattr(artifacts, "source", None)
+    if source is not None and Path(source.data_path) != Path(model_path):
+        try:
+            artifacts.source = resolve_reservoir_source(model_path)
+        except FileNotFoundError:
+            pass
+    return artifacts
 
 
 def load_preprocessing_artifacts(
@@ -184,7 +233,7 @@ def load_preprocessing_artifacts(
 ):
     metadata = load_preprocessing_metadata(cache_dir)
     if expected_model_path is not None:
-        expected = str(Path(expected_model_path).resolve())
+        expected = str(Path(expected_model_path).expanduser().resolve())
         actual = str(Path(metadata["model_path"]).resolve())
         if expected != actual:
             raise ValueError(f"Reservoir preprocessing cache model mismatch: expected {expected}, found {actual}")
@@ -198,7 +247,7 @@ def load_preprocessing_artifacts(
             f"built from have changed: {'; '.join(stale)}. Rebuild it (Prep-Reservoir.ipynb with "
             "FORCE_REBUILD = True) before trusting any state, well or table read from it.",
             RuntimeWarning, stacklevel=2)
-    return joblib.load(artifacts_path)
+    return _rebind_source(joblib.load(artifacts_path), metadata["model_path"])
 
 
 def build_or_load_preprocessing_artifacts(
@@ -216,6 +265,12 @@ def build_or_load_preprocessing_artifacts(
             print(f"[prep-cache] rebuilding {cache_dir}: {'; '.join(stale)}")
             force_rebuild = True
         else:
+            if stale:
+                warnings.warn(
+                    f"the reservoir preprocessing cache {cache_dir} is stale "
+                    f"({'; '.join(stale)}); it is used as it is. Rebuild it with "
+                    "Prep-Reservoir.ipynb (FORCE_REBUILD) or a campaign prep job.",
+                    RuntimeWarning, stacklevel=2)
             return load_preprocessing_artifacts(cache_dir, expected_model_path=model_path)
     if not build_if_missing and not force_rebuild:
         raise FileNotFoundError(
@@ -223,6 +278,6 @@ def build_or_load_preprocessing_artifacts(
             "Run Prep-Reservoir.ipynb first, or set BUILD_PREP_CACHE_IF_MISSING = True."
         )
     kwargs = dict(build_kwargs or {})
-    artifacts = build_reservoir_preprocessing_artifacts(str(Path(model_path).resolve()), **kwargs)
+    artifacts = build_reservoir_preprocessing_artifacts(str(Path(model_path).expanduser().resolve()), **kwargs)
     save_preprocessing_artifacts(cache_dir, artifacts, config=kwargs)
     return artifacts
